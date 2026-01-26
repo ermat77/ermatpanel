@@ -1,0 +1,92 @@
+plugins {
+    id 'java'
+    id 'org.jetbrains.gradle.plugin.idea-ext' version '1.3'  // Required for IDEA run configurations
+}
+
+group = 'com.kyuubisoft'
+version = '1.2.1'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+// No external repositories needed - Prometheus format is implemented manually
+
+// Hytale installation directory - matches the working plugin pattern
+ext {
+    hytaleHome = System.getenv('HYTALE_HOME') ?: 
+        (System.getProperty('os.name').toLowerCase().contains('windows')
+            ? "${System.getProperty('user.home')}/AppData/Roaming/Hytale"
+            : "${System.getProperty('user.home')}/.hytale")
+    patchline = System.getenv('HYTALE_PATCHLINE') ?: 'release'
+}
+
+// Hytale Server JAR path - supports both Windows and Unix paths
+// Priority: Environment variable > Windows default > Unix default
+def hytaleJarPath = System.getenv('HYTALE_SERVER_JAR') ?: 
+    file("$hytaleHome/install/$patchline/package/game/latest/Server/HytaleServer.jar").absolutePath
+
+dependencies {
+    // Hytale Server API (includes Netty, Gson, etc.)
+    // Set HYTALE_SERVER_JAR environment variable to override default path
+    // Using 'implementation' instead of 'compileOnly' so it's available at runtime for IDEA run configuration
+    // This won't be bundled in the final JAR (jar task excludes dependencies)
+    implementation files(hytaleJarPath)
+}
+
+// Print the path being used (helpful for debugging)
+println "Using HytaleServer.jar from: ${hytaleJarPath}"
+
+jar {
+    archiveBaseName.set('KyuubiSoftAPI')
+    archiveVersion.set(version)
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+
+    manifest {
+        attributes(
+            'Implementation-Title': 'KyuubiSoft API',
+            'Implementation-Version': version
+        )
+    }
+}
+
+// Create the working directory to run the server if it does not already exist.
+def serverRunDir = file("$projectDir/run")
+if (!serverRunDir.exists()) {
+    serverRunDir.mkdirs()
+}
+
+// Creates a run configuration in IDEA that will run the Hytale server with
+// your plugin and the default assets.
+// This matches the pattern from the working plugin example
+def assetsZipPath = file("$hytaleHome/install/$patchline/package/game/latest/Assets.zip")
+
+idea.project.settings.runConfigurations {
+    'HytaleServer'(org.jetbrains.gradle.ext.Application) {
+        mainClass = 'com.hypixel.hytale.Main'
+        moduleName = project.idea.module.name + '.main'
+        
+        // Use Assets.zip from game/latest/ directory (matches working plugin pattern)
+        // The server expects --assets to point to Assets.zip
+        programParameters = "--allow-op --assets=$hytaleHome/install/$patchline/package/game/latest/Assets.zip --bind 0.0.0.0:5520"
+        
+        // Use local run directory as working directory (matches working plugin pattern)
+        // The server will look for HytaleAssets/ in this directory
+        workingDirectory = serverRunDir.absolutePath
+        
+        // Ensure HytaleServer.jar is on the classpath
+        // The module classpath will include implementation dependencies
+    }
+}
+
+// Print configuration info
+println "✅ IDEA run configuration 'HytaleServer' created"
+println "   Hytale Home: $hytaleHome"
+println "   Patchline: $patchline"
+println "   Assets.zip: $assetsZipPath"
+println "   Working directory: ${serverRunDir.absolutePath}"
+println ""
+println "⚠️  Note: Make sure HytaleAssets/ directory exists in the working directory"
+println "   You may need to extract Assets.zip or create a symlink:"
+println "   ln -s $hytaleHome/install/$patchline/package/game/latest/HytaleAssets ${serverRunDir}/HytaleAssets"

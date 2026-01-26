@@ -1,0 +1,148 @@
+# ============================================================
+# Development Docker Compose - Hytale Server Only
+# ============================================================
+# Use this for local development:
+#   docker-compose -f docker-compose.dev.yml up -d
+#
+# This runs ONLY the Hytale server container.
+# Backend and frontend run locally on your machine.
+#
+# DEVELOPMENT MODE:
+#   - Manager (backend + frontend): Runs locally (not containerized)
+#   - HytaleServer: Runs in Docker container
+#   - Backend connects to container via Docker API
+#   - Plugin API accessible on localhost:18085
+#
+# VOLUME MOUNTS:
+#   - Server files must be in ./hytale-server/ folder (or set HOST_DATA_PATH)
+#   - Files are bind-mounted into container
+#   - Changes in Cursor/editor are immediately visible in container
+#
+# NETWORKING:
+#   - Container on 'dev-net' bridge network
+#   - Container name: ${STACK_NAME}-dev (default: hytale-dev)
+#   - Plugin port 18085 exposed to host for local backend
+# ============================================================
+
+services:
+  hytale:
+    build: .
+    container_name: ${STACK_NAME:-hytale}-dev
+    hostname: ${STACK_NAME:-hytale}-dev
+    restart: unless-stopped
+    
+    environment:
+      # Debug: Current working directory (where docker-compose was run from)
+      - PWD=${PWD}
+      
+      # Java / RAM
+      - JAVA_MIN_RAM=${JAVA_MIN_RAM:-3G}
+      - JAVA_MAX_RAM=${JAVA_MAX_RAM:-4G}
+      
+      # Server
+      - SERVER_PORT=${SERVER_PORT:-5520}
+      - SERVER_BIND=0.0.0.0
+      - TZ=${TZ:-Europe/Berlin}
+      
+      # Backups (built-in backup disabled by default)
+      - ENABLE_BACKUP=${ENABLE_BACKUP:-false}
+      - BACKUP_FREQUENCY=${BACKUP_FREQUENCY:-30}
+      
+      # Auth
+      - AUTH_MODE=${AUTH_MODE:-}
+      
+      # Download URLs (Option 1)
+      - SERVER_JAR_URL=${SERVER_JAR_URL:-}
+      - ASSETS_URL=${ASSETS_URL:-}
+      
+      # Hytale Downloader (Option 2)
+      - USE_HYTALE_DOWNLOADER=${USE_HYTALE_DOWNLOADER:-false}
+      - HYTALE_PATCHLINE=${HYTALE_PATCHLINE:-release}
+      
+      # Auto-update on restart
+      - AUTO_UPDATE=${AUTO_UPDATE:-false}
+
+      # EasyWebMap (optional)
+      - WEBMAP_PORT=${WEBMAP_PORT:-18081}
+      - WEBMAP_WS_PORT=${WEBMAP_WS_PORT:-18082}
+
+    # Ports - UDP for game, TCP for webmap and plugin API
+    ports:
+      - "${SERVER_PORT:-5520}:${SERVER_PORT:-5520}/udp"
+      - "${WEBMAP_PORT:-18081}:${WEBMAP_PORT:-18081}/tcp"
+      - "${WEBMAP_WS_PORT:-18082}:${WEBMAP_WS_PORT:-18082}/tcp"
+      # Plugin API port (exposed for local backend connection)
+      - "18085:18085/tcp"
+    
+    # Volumes - Bind Mounts (HOST_DATA_PATH -> /opt/hytale in Container)
+    # IMPORTANT: Server files (HytaleServer.jar, Assets.zip) must be in hytale-server/ folder
+    # If files are missing, container will:
+    #   1. Check for download URLs (SERVER_JAR_URL, ASSETS_URL)
+    #   2. Use Hytale Downloader (USE_HYTALE_DOWNLOADER=true)
+    #   3. Wait for manual file copy
+    # Bundling mechanism removed - files must come from volume or download
+    volumes:
+      # Using relative paths (relative to docker-compose.dev.yml location)
+      # Alternative: Use ${PWD}/hytale-server for absolute paths (if PWD env var is set)
+      - ${PWD}/${HOST_DATA_PATH:-hytale-server}:/opt/hytale/server
+      - ${PWD}/${HOST_DATA_PATH:-hytale-server}/data:/opt/hytale/data
+      - ${PWD}/${HOST_DATA_PATH:-hytale-server}/backups:/opt/hytale/backups
+      - ${PWD}/${HOST_DATA_PATH:-hytale-server}/mods:/opt/hytale/mods
+      - ${PWD}/${HOST_DATA_PATH:-hytale-server}/downloader:/opt/hytale/downloader
+      - ${PWD}/${HOST_DATA_PATH:-hytale-server}/auth:/opt/hytale/auth
+      - ${PWD}/${HOST_DATA_PATH:-hytale-server}/updater:/opt/hytale/server/updater
+
+    # Console
+    stdin_open: true
+    tty: true
+    
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+    # Network - use bridge network so container name is accessible from host
+    # The container name (hytale-dev) will be resolvable from the host
+    # Backend (running locally) can:
+    #   - Connect to plugin API: http://localhost:18085 (port exposed to host)
+    #   - Use Docker API to manage container (via Docker socket)
+    #   - Access files via Docker API (docker exec, docker cp)
+    networks:
+      - dev-net
+
+    # SECURITY: Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '${DOCKER_CPU_LIMIT:-4}'
+          memory: ${DOCKER_MEMORY_LIMIT:-8G}
+        reservations:
+          cpus: '1'
+          memory: ${JAVA_MAX_RAM:-4G}
+
+    # SECURITY: Prevent privilege escalation
+    security_opt:
+      - no-new-privileges:true
+
+    # SECURITY: Drop unnecessary capabilities
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+      - NET_BIND_SERVICE
+
+# ============================================================
+# Networks
+# ============================================================
+# Bridge network allows container to be accessible from host
+# Container name resolves to IP on this network
+# Backend running locally connects via Docker socket (not this network)
+networks:
+  dev-net:
+    name: ${STACK_NAME:-hytale}-dev-net
+    driver: bridge

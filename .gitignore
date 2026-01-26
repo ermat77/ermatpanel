@@ -1,0 +1,33 @@
+# Server files (too large for git)
+*.jar
+*.zip
+*.aot
+
+# Exception: Include bundled plugin JAR for manager
+!manager/backend/assets/plugins/*.jar
+
+# Local test data
+data/
+backups/
+logs/
+server/
+hytale-server/
+
+# Environment (enthält evtl. URLs/Secrets)
+.env
+!.env.example
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node.js / Manager
+node_modules/
+dist/
+package-lock.json
+manager/static/

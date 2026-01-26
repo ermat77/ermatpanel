@@ -1,0 +1,134 @@
+import { defineStore } from 'pinia'
+import { ref, computed } from 'vue'
+import { authApi, type TokenResponse } from '@/api/auth'
+
+// Safe localStorage access for SSR/build compatibility
+const getStorageItem = (key: string): string | null => {
+  if (typeof localStorage !== 'undefined') {
+    return localStorage.getItem(key)
+  }
+  return null
+}
+
+const setStorageItem = (key: string, value: string): void => {
+  if (typeof localStorage !== 'undefined') {
+    localStorage.setItem(key, value)
+  }
+}
+
+const removeStorageItem = (key: string): void => {
+  if (typeof localStorage !== 'undefined') {
+    localStorage.removeItem(key)
+  }
+}
+
+export type UserRole = 'admin' | 'moderator' | 'operator' | 'viewer'
+
+export const useAuthStore = defineStore('auth', () => {
+  // State
+  const accessToken = ref<string | null>(getStorageItem('accessToken'))
+  const refreshToken = ref<string | null>(getStorageItem('refreshToken'))
+  const username = ref<string | null>(getStorageItem('username'))
+  const role = ref<UserRole | null>((getStorageItem('role') as UserRole) || null)
+  const permissions = ref<string[]>(JSON.parse(getStorageItem('permissions') || '[]'))
+
+  // Getters
+  const isAuthenticated = computed(() => !!accessToken.value)
+  const isAdmin = computed(() => role.value === 'admin')
+
+  // Permission checking functions
+  function hasPermission(permission: string): boolean {
+    if (permissions.value.includes('*')) return true
+    return permissions.value.includes(permission)
+  }
+
+  function hasAnyPermission(...perms: string[]): boolean {
+    return perms.some(p => hasPermission(p))
+  }
+
+  // Permission-based computed properties
+  const canManageServer = computed(() => hasAnyPermission('server.start', 'server.stop'))
+  const canRestartServer = computed(() => hasPermission('server.restart'))
+  const canViewConsole = computed(() => hasPermission('console.view'))
+  const canViewPerformance = computed(() => hasPermission('performance.view'))
+  const canManagePlayers = computed(() => hasAnyPermission('players.view', 'players.kick', 'players.ban'))
+  const canManageBackups = computed(() => hasPermission('backups.view'))
+  const canManageConfig = computed(() => hasPermission('config.view'))
+
+  // Actions
+  function setTokens(access: string, refresh: string) {
+    accessToken.value = access
+    refreshToken.value = refresh
+    setStorageItem('accessToken', access)
+    setStorageItem('refreshToken', refresh)
+  }
+
+  function setUser(name: string, userRole?: UserRole, userPermissions?: string[]) {
+    username.value = name
+    setStorageItem('username', name)
+    if (userRole) {
+      role.value = userRole
+      setStorageItem('role', userRole)
+    }
+    if (userPermissions) {
+      permissions.value = userPermissions
+      setStorageItem('permissions', JSON.stringify(userPermissions))
+    }
+  }
+
+  async function login(credentials: { username: string; password: string }) {
+    const response = await authApi.login(credentials)
+    setTokens(response.access_token, response.refresh_token)
+    setUser(credentials.username, response.role as UserRole, response.permissions)
+    return response
+  }
+
+  async function refresh() {
+    if (!refreshToken.value) {
+      throw new Error('No refresh token')
+    }
+    const response = await authApi.refresh(refreshToken.value)
+    setTokens(response.access_token, response.refresh_token)
+    return response
+  }
+
+  function logout() {
+    accessToken.value = null
+    refreshToken.value = null
+    username.value = null
+    role.value = null
+    permissions.value = []
+    removeStorageItem('accessToken')
+    removeStorageItem('refreshToken')
+    removeStorageItem('username')
+    removeStorageItem('role')
+    removeStorageItem('permissions')
+  }
+
+  return {
+    // State
+    accessToken,
+    refreshToken,
+    username,
+    role,
+    permissions,
+    // Getters
+    isAuthenticated,
+    isAdmin,
+    canManageServer,
+    canRestartServer,
+    canViewConsole,
+    canViewPerformance,
+    canManagePlayers,
+    canManageBackups,
+    canManageConfig,
+    // Actions
+    setTokens,
+    setUser,
+    login,
+    refresh,
+    logout,
+    hasPermission,
+    hasAnyPermission,
+  }
+})

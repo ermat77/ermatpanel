@@ -1,0 +1,93 @@
+# ============================================================
+# Hytale Dedicated Server - Docker Image
+# Fully automated - downloads server files on first start
+# ============================================================
+
+FROM eclipse-temurin:25-jdk-noble
+
+LABEL maintainer="Ermat"
+LABEL description="Hytale Dedicated Server - Auto-Setup"
+LABEL version="2.0"
+
+# ============================================================
+# Environment Variables
+# ============================================================
+ENV JAVA_MIN_RAM="3G" \
+    JAVA_MAX_RAM="4G" \
+    SERVER_PORT="5520" \
+    SERVER_BIND="0.0.0.0" \
+    ENABLE_BACKUP="false" \
+    BACKUP_FREQUENCY="30" \
+    TZ="Europe/Berlin" \
+    # Option 1: Direct URLs to server files
+    SERVER_JAR_URL="" \
+    ASSETS_URL="" \
+    # Option 2: Use official Hytale Downloader
+    USE_HYTALE_DOWNLOADER="false" \
+    HYTALE_PATCHLINE="release" \
+    # Auto-update on container restart
+    AUTO_UPDATE="false"
+
+# ============================================================
+# Install dependencies
+# ============================================================
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    wget \
+    unzip \
+    jq \
+    tzdata \
+    gosu \
+    ca-certificates \
+    dbus \
+    && rm -rf /var/lib/apt/lists/*
+# Note: Timezone is set at runtime in entrypoint.sh using TZ env variable
+
+# ============================================================
+# Create user and directories
+# ============================================================
+# Use UID 9999 to avoid conflicts with existing users
+RUN groupadd -g 9999 hytale \
+    && useradd -u 9999 -g hytale -m -s /bin/bash hytale \
+    && mkdir -p /opt/hytale/server \
+                /opt/hytale/data \
+                /opt/hytale/backups \
+                /opt/hytale/plugins \
+                /opt/hytale/mods \
+                /opt/hytale/logs \
+                /opt/hytale/downloader \
+                /opt/hytale/auth \
+    && chown -R hytale:hytale /opt/hytale
+
+WORKDIR /opt/hytale
+
+# ============================================================
+# Copy scripts
+# ============================================================
+COPY --chmod=755 scripts/entrypoint.sh /opt/hytale/entrypoint.sh
+COPY --chmod=755 scripts/start-server.sh /opt/hytale/start-server.sh
+COPY --chmod=755 scripts/backup.sh /opt/hytale/backup.sh
+
+# ============================================================
+# Volumes for persistent data
+# ============================================================
+# NOTE: Server files (HytaleServer.jar, Assets.zip) must be provided via:
+#   - Volume mounts (bind mount from host hytale-server/ folder)
+#   - Download URLs (SERVER_JAR_URL, ASSETS_URL environment variables)
+#   - Hytale Downloader (USE_HYTALE_DOWNLOADER=true)
+# Bundling mechanism removed to reduce build time.
+# ============================================================
+VOLUME ["/opt/hytale/data", "/opt/hytale/backups", "/opt/hytale/plugins", "/opt/hytale/mods", "/opt/hytale/server", "/opt/hytale/downloader", "/opt/hytale/auth"]
+
+# ============================================================
+# Expose UDP port (QUIC protocol)
+# ============================================================
+EXPOSE 5520/udp
+
+# ============================================================
+# Health check
+# ============================================================
+HEALTHCHECK --interval=60s --timeout=10s --start-period=180s --retries=3 \
+    CMD pgrep -f "HytaleServer.jar" > /dev/null || exit 1
+
+ENTRYPOINT ["/opt/hytale/entrypoint.sh"]

@@ -1,0 +1,255 @@
+# ============================================================
+# Hytale Dedicated Server - Docker Compose
+# ============================================================
+#
+# STACK_NAME: ${STACK_NAME} (Standard: hytale)
+#   -> Container: ${STACK_NAME}, ${STACK_NAME}-manager
+#   -> Netzwerk: ${STACK_NAME}-net
+#
+# HOST PFADE: ${HOST_DATA_PATH} (Standard: /opt/hytale)
+# CONTAINER PFADE: /opt/hytale/
+#
+# PORTAINER SETUP:
+# 1. Repository URL eingeben
+# 2. Environment Variables in Portainer setzen (NICHT als .env Datei!)
+# 3. Deploy
+# 4. Nach Start: /auth login device
+#
+# LOKAL:
+# 1. cp .env.example .env
+# 2. .env anpassen (STACK_NAME, HOST_DATA_PATH, Ports, etc.)
+# 3. docker-compose up -d
+#
+# WEB MANAGER:
+# Nach dem Start erreichbar unter http://localhost:18080
+# Login mit MANAGER_USERNAME/MANAGER_PASSWORD
+#
+# ============================================================
+
+services:
+  hytale:
+    build: .
+    container_name: ${STACK_NAME:-hytale}
+    hostname: ${STACK_NAME:-hytale}
+    restart: on-failure:3
+    
+    environment:
+      # Java / RAM
+      - JAVA_MIN_RAM=${JAVA_MIN_RAM:-3G}
+      - JAVA_MAX_RAM=${JAVA_MAX_RAM:-4G}
+      
+      # Server
+      - SERVER_PORT=${SERVER_PORT:-5520}
+      - SERVER_BIND=${SERVER_BIND:-0.0.0.0}
+      - TZ=${TZ:-Europe/Berlin}
+      
+      # Backups (built-in backup disabled by default - creates empty files)
+      # Use manager scheduler backups instead
+      - ENABLE_BACKUP=${ENABLE_BACKUP:-false}
+      - BACKUP_FREQUENCY=${BACKUP_FREQUENCY:-30}
+      
+      # Auth
+      - AUTH_MODE=${AUTH_MODE:-}
+      
+      # Download URLs (Option 1)
+      - SERVER_JAR_URL=${SERVER_JAR_URL:-}
+      - ASSETS_URL=${ASSETS_URL:-}
+      
+      # Hytale Downloader (Option 2)
+      - USE_HYTALE_DOWNLOADER=${USE_HYTALE_DOWNLOADER:-false}
+      - HYTALE_PATCHLINE=${HYTALE_PATCHLINE:-release}
+      
+      # Auto-update on restart
+      - AUTO_UPDATE=${AUTO_UPDATE:-false}
+
+      # EasyWebMap (optional)
+      - WEBMAP_PORT=${WEBMAP_PORT:-18081}
+      - WEBMAP_WS_PORT=${WEBMAP_WS_PORT:-18082}
+
+    # Ports - UDP for game, TCP for webmap
+    ports:
+      - "${SERVER_PORT:-5520}:${SERVER_PORT:-5520}/udp"
+      - "${WEBMAP_PORT:-18081}:${WEBMAP_PORT:-18081}/tcp"
+      - "${WEBMAP_WS_PORT:-18082}:${WEBMAP_WS_PORT:-18082}/tcp"
+    
+    # Volumes - Bind Mounts (HOST_DATA_PATH -> /opt/hytale im Container)
+    volumes:
+      - ${HOST_DATA_PATH:-/opt/hytale}/server:/opt/hytale/server
+      - ${HOST_DATA_PATH:-/opt/hytale}/data:/opt/hytale/data
+      - ${HOST_DATA_PATH:-/opt/hytale}/backups:/opt/hytale/backups
+      - ${HOST_DATA_PATH:-/opt/hytale}/plugins:/opt/hytale/plugins
+      - ${HOST_DATA_PATH:-/opt/hytale}/mods:/opt/hytale/mods
+      - ${HOST_DATA_PATH:-/opt/hytale}/downloader:/opt/hytale/downloader
+      - ${HOST_DATA_PATH:-/opt/hytale}/auth:/opt/hytale/auth
+      - ${HOST_DATA_PATH:-/opt/hytale}/updater:/opt/hytale/server/updater
+
+    # Console
+    stdin_open: true
+    tty: true
+    
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+    # Network for manager communication
+    networks:
+      - internal-net
+
+    # SECURITY: Resource limits to prevent resource exhaustion
+    # Note: DOCKER_MEMORY_LIMIT should be >= JAVA_MAX_RAM + 1G for overhead
+    deploy:
+      resources:
+        limits:
+          cpus: '${DOCKER_CPU_LIMIT:-4}'
+          memory: ${DOCKER_MEMORY_LIMIT:-8G}
+        reservations:
+          cpus: '1'
+          memory: ${JAVA_MAX_RAM:-4G}
+
+    # SECURITY: Prevent privilege escalation
+    security_opt:
+      - no-new-privileges:true
+
+    # SECURITY: Drop unnecessary capabilities
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN            # Required for changing file ownership
+      - SETUID           # Required for switching to hytale user
+      - SETGID           # Required for switching to hytale group
+      - DAC_OVERRIDE     # Required for chmod on bind-mounted volumes
+      - NET_BIND_SERVICE # Allow binding to privileged ports if needed
+
+  # ============================================================
+  # Hytale Server Manager - Web UI
+  # ============================================================
+  hytale-manager:
+    build: ./manager
+    container_name: ${STACK_NAME:-hytale}-manager
+    hostname: ${STACK_NAME:-hytale}-manager
+    restart: unless-stopped
+
+    environment:
+      # Authentication (REQUIRED - no defaults for security)
+      # SECURITY: These MUST be set in your .env file or Portainer environment
+      # The manager will fail to start in strict mode without proper credentials
+      - MANAGER_USERNAME=${MANAGER_USERNAME:-}
+      - MANAGER_PASSWORD=${MANAGER_PASSWORD:-}
+      - JWT_SECRET=${JWT_SECRET:-}
+      # CORS Origins (REQUIRED for security)
+      - CORS_ORIGINS=${CORS_ORIGINS:-}
+      # Security mode: 'strict' (default) or 'warn'
+      - SECURITY_MODE=${SECURITY_MODE:-strict}
+      # Trust proxy for X-Forwarded-* headers (set to true if behind reverse proxy)
+      - TRUST_PROXY=${TRUST_PROXY:-false}
+
+      # Demo mode (disables real server, uses mock data)
+      - DEMO_MODE=${DEMO_MODE:-false}
+
+      # Target container
+      - GAME_CONTAINER_NAME=${STACK_NAME:-hytale}
+
+      # Manager port (for display purposes - internal port is always 18080)
+      - MANAGER_PORT=${MANAGER_PORT:-18080}
+
+      # Server port (for display in setup wizard)
+      - SERVER_PORT=${SERVER_PORT:-5520}
+
+      # WebMap ports (for display in setup wizard)
+      - WEBMAP_PORT=${WEBMAP_PORT:-18081}
+      - WEBMAP_WS_PORT=${WEBMAP_WS_PORT:-18082}
+
+      # Paths (inside container)
+      - SERVER_PATH=/opt/hytale/server
+      - BACKUPS_PATH=/opt/hytale/backups
+      - DATA_PATH=/opt/hytale/data
+      - ASSETS_PATH=/opt/hytale/assets
+
+      # Settings
+      - TZ=${TZ:-Europe/Berlin}
+
+      # Modtale API (optional)
+      - MODTALE_API_KEY=${MODTALE_API_KEY:-}
+
+      # StackMart API (optional)
+      - STACKMART_API_KEY=${STACKMART_API_KEY:-}
+
+      # Host data path (for error messages)
+      - HOST_DATA_PATH=${HOST_DATA_PATH:-/opt/hytale}
+
+    ports:
+      - "${MANAGER_PORT:-18080}:18080"
+
+    volumes:
+      # Docker socket for container management
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+      # Shared volumes with game server (HOST_DATA_PATH -> /opt/hytale im Container)
+      # Server configs need write access for the config editor
+      - ${HOST_DATA_PATH:-/opt/hytale}/server:/opt/hytale/server
+      - ${HOST_DATA_PATH:-/opt/hytale}/backups:/opt/hytale/backups
+      - ${HOST_DATA_PATH:-/opt/hytale}/data:/opt/hytale/data
+      - ${HOST_DATA_PATH:-/opt/hytale}/mods:/opt/hytale/mods
+      - ${HOST_DATA_PATH:-/opt/hytale}/plugins:/opt/hytale/plugins
+      - ${HOST_DATA_PATH:-/opt/hytale}/auth:/opt/hytale/auth:ro
+
+      # Asset Explorer cache (extracted game assets)
+      - ${HOST_DATA_PATH:-/opt/hytale}/assets:/opt/hytale/assets
+
+      # Manager persistent data
+      - manager-data:/app/data
+
+    networks:
+      - internal-net
+
+    depends_on:
+      - hytale
+
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # SECURITY: Resource limits for manager
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+
+    # SECURITY: Prevent privilege escalation
+    security_opt:
+      - no-new-privileges:true
+
+    # SECURITY: Drop all capabilities, add only what's needed
+    # The manager only needs network access and Docker socket
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN            # Required for fixing permissions on mounted volumes
+      - SETUID           # Required for switching to manager user
+      - SETGID           # Required for switching to manager group
+      - DAC_OVERRIDE     # Required for chmod on bind-mounted volumes (files owned by other UIDs)
+
+# ============================================================
+# Networks
+# ============================================================
+networks:
+  internal-net:
+    name: ${STACK_NAME:-hytale}-net
+    driver: bridge
+
+# ============================================================
+# Volumes
+# ============================================================
+volumes:
+  manager-data:
+    name: ${STACK_NAME:-hytale}-manager-data
