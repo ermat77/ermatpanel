@@ -129,12 +129,6 @@ const knownCommands = [
   '/kill',
   '/damage',
   '/emote',
-  // Plugins
-  '/plugin',
-  '/plugin list',
-  '/plugin load',
-  '/plugin unload',
-  '/plugin reload',
   // Chat & Communication
   '/say',
   '/msg',

@@ -3,7 +3,6 @@ import rateLimit from 'express-rate-limit';
 import { authMiddleware } from '../middleware/auth.js';
 import { requirePermission } from '../middleware/permissions.js';
 import * as assetService from '../services/assets.js';
-import { isDemoMode, getDemoAssetStatus, getDemoAssetDirectory, getDemoAssetTree, getDemoAssetSearchResults, getDemoItems } from '../services/demoData.js';
 
 const router = Router();
 
@@ -46,29 +45,13 @@ function setCachedIconPath(itemId: string, path: string | null): void {
 }
 
 // GET /api/assets/status - Get extraction status
-router.get('/status', authMiddleware, requirePermission('assets.view'), (_req: Request, res: Response) => {
-  // In demo mode, still check for real assets first (user may have copied Assets.zip)
-  const status = assetService.getAssetStatus();
-
-  // If in demo mode and no real assets exist, return demo status
-  if (isDemoMode() && !status.sourceExists && !status.extracted) {
-    res.json(getDemoAssetStatus());
-    return;
-  }
-
+router.get('/status', authMiddleware, requirePermission('assets.view'), async (_req: Request, res: Response) => {
+  const status = await assetService.getAssetStatus();
   res.json(status);
 });
 
 // POST /api/assets/extract - Extract assets from archive
 router.post('/extract', authMiddleware, requirePermission('assets.manage'), (_req: Request, res: Response) => {
-  // In demo mode, still allow real extraction if Assets.zip exists
-  const archiveExists = assetService.findAssetsArchive() !== null;
-
-  if (isDemoMode() && !archiveExists) {
-    res.json({ success: true, message: '[DEMO] No Assets.zip found. Copy it to the server directory to use real icons.' });
-    return;
-  }
-
   const result = assetService.extractAssets();
 
   // Clear icon path cache when re-extracting
@@ -87,12 +70,6 @@ router.post('/extract', authMiddleware, requirePermission('assets.manage'), (_re
 
 // DELETE /api/assets/cache - Clear extracted assets
 router.delete('/cache', authMiddleware, requirePermission('assets.manage'), (_req: Request, res: Response) => {
-  // Demo mode: simulate cache clear
-  if (isDemoMode()) {
-    res.json({ success: true, message: '[DEMO] Asset cache cleared (simulated)' });
-    return;
-  }
-
   const result = assetService.clearAssets();
 
   // Clear icon path cache as well
@@ -110,17 +87,10 @@ router.delete('/cache', authMiddleware, requirePermission('assets.manage'), (_re
 });
 
 // GET /api/assets/browse - List directory contents
-router.get('/browse', authMiddleware, requirePermission('assets.view'), (req: Request, res: Response) => {
-  // Demo mode: return demo directory
-  if (isDemoMode()) {
-    const relativePath = (req.query.path as string) || '';
-    res.json({ path: relativePath, items: getDemoAssetDirectory() });
-    return;
-  }
-
+router.get('/browse', authMiddleware, requirePermission('assets.view'), async (req: Request, res: Response) => {
   const relativePath = (req.query.path as string) || '';
 
-  const items = assetService.listAssetDirectory(relativePath);
+  const items = await assetService.listAssetDirectory(relativePath);
 
   if (items === null) {
     res.status(404).json({ detail: 'Directory not found or invalid path' });
@@ -134,17 +104,11 @@ router.get('/browse', authMiddleware, requirePermission('assets.view'), (req: Re
 });
 
 // GET /api/assets/tree - Get directory tree
-router.get('/tree', authMiddleware, requirePermission('assets.view'), (req: Request, res: Response) => {
-  // Demo mode: return demo tree
-  if (isDemoMode()) {
-    res.json(getDemoAssetTree());
-    return;
-  }
-
+router.get('/tree', authMiddleware, requirePermission('assets.view'), async (req: Request, res: Response) => {
   const relativePath = (req.query.path as string) || '';
   const maxDepth = Math.min(parseInt(req.query.depth as string) || 3, 5);
 
-  const tree = assetService.getAssetTree(relativePath, maxDepth);
+  const tree = await assetService.getAssetTree(relativePath, maxDepth);
 
   if (tree === null) {
     res.status(404).json({ detail: 'Directory not found or invalid path' });
@@ -160,18 +124,6 @@ router.get('/file', authMiddleware, requirePermission('assets.view'), (req: Requ
 
   if (!relativePath) {
     res.status(400).json({ detail: 'Path parameter required' });
-    return;
-  }
-
-  // Demo mode: return demo file content
-  if (isDemoMode()) {
-    res.json({
-      path: relativePath,
-      content: '// [DEMO] File content not available in demo mode',
-      mimeType: 'text/plain',
-      size: 50,
-      isBinary: false,
-    });
     return;
   }
 
@@ -193,18 +145,11 @@ router.get('/file', authMiddleware, requirePermission('assets.view'), (req: Requ
 
 // GET /api/assets/search - Search for files
 // Supports: plain text, glob patterns (*.json, sign*.json), regex (/pattern/flags)
-router.get('/search', authMiddleware, requirePermission('assets.view'), (req: Request, res: Response) => {
+router.get('/search', authMiddleware, requirePermission('assets.view'), async (req: Request, res: Response) => {
   const query = req.query.q as string;
 
   if (!query || query.length < 2) {
     res.status(400).json({ detail: 'Search query must be at least 2 characters' });
-    return;
-  }
-
-  // Demo mode: return demo search results
-  if (isDemoMode()) {
-    const results = getDemoAssetSearchResults(query);
-    res.json({ query, count: results.length, results, mode: 'demo' });
     return;
   }
 
@@ -214,7 +159,7 @@ router.get('/search', authMiddleware, requirePermission('assets.view'), (req: Re
   const useRegex = req.query.regex === 'true';
   const useGlob = req.query.glob === 'true';
 
-  const results = assetService.searchAssets(query, {
+  const results = await assetService.searchAssets(query, {
     searchContent,
     extensions,
     maxResults,
@@ -264,7 +209,7 @@ router.get('/download/*', authMiddleware, requirePermission('assets.view'), (req
 // GET /api/assets/item-icon/:itemId - Get item icon image
 // Searches common paths for item icons and returns the image
 // NOTE: Public endpoint with rate limiting - required for <img> tags to load icons
-router.get('/item-icon/:itemId', publicAssetLimiter, (req: Request, res: Response) => {
+router.get('/item-icon/:itemId', publicAssetLimiter, async (req: Request, res: Response) => {
   let { itemId } = req.params;
 
   // SECURITY: Validate item ID format
@@ -278,7 +223,7 @@ router.get('/item-icon/:itemId', publicAssetLimiter, (req: Request, res: Respons
     itemId = itemId.split(':')[1];
   }
 
-  // Helper function to generate placeholder SVG for demo mode
+  // Helper function to generate placeholder SVG
   const sendPlaceholderIcon = () => {
     const itemLower = itemId.toLowerCase();
     let color = '#6b7280'; // Default gray
@@ -315,11 +260,6 @@ router.get('/item-icon/:itemId', publicAssetLimiter, (req: Request, res: Respons
   const cachedPath = getCachedIconPath(itemId);
   if (cachedPath !== undefined) {
     if (cachedPath === null) {
-      // Cached as not found - in demo mode return placeholder
-      if (isDemoMode()) {
-        sendPlaceholderIcon();
-        return;
-      }
       res.status(404).json({ detail: 'Item icon not found (cached)', itemId });
       return;
     }
@@ -364,7 +304,7 @@ router.get('/item-icon/:itemId', publicAssetLimiter, (req: Request, res: Respons
   }
 
   // If not found in standard paths, try a search for the item name
-  const searchResults = assetService.searchAssets(itemId, {
+  const searchResults = await assetService.searchAssets(itemId, {
     extensions: ['.png'],
     maxResults: 5,
     useGlob: false,
@@ -372,7 +312,7 @@ router.get('/item-icon/:itemId', publicAssetLimiter, (req: Request, res: Respons
 
   // Also try lowercase search
   if (searchResults.length === 0) {
-    const lowerSearchResults = assetService.searchAssets(itemLower, {
+    const lowerSearchResults = await assetService.searchAssets(itemLower, {
       extensions: ['.png'],
       maxResults: 5,
       useGlob: false,
@@ -414,12 +354,6 @@ router.get('/item-icon/:itemId', publicAssetLimiter, (req: Request, res: Respons
   // Cache as not found to avoid repeated searches
   setCachedIconPath(itemId, null);
 
-  // In demo mode, return placeholder instead of 404
-  if (isDemoMode()) {
-    sendPlaceholderIcon();
-    return;
-  }
-
   // SECURITY: Don't expose debug information in production
   res.status(404).json({ detail: 'Item icon not found' });
 });
@@ -427,7 +361,7 @@ router.get('/item-icon/:itemId', publicAssetLimiter, (req: Request, res: Respons
 // GET /api/assets/player-avatar - Get a player avatar/face texture
 // Searches for player character textures in the assets
 // NOTE: Public endpoint with rate limiting - required for <img> tags
-router.get('/player-avatar', publicAssetLimiter, (req: Request, res: Response) => {
+router.get('/player-avatar', publicAssetLimiter, async (req: Request, res: Response) => {
   // Helper function to send placeholder avatar
   const sendPlaceholderAvatar = () => {
     const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
@@ -488,7 +422,7 @@ router.get('/player-avatar', publicAssetLimiter, (req: Request, res: Response) =
   ];
 
   for (const term of searchTerms) {
-    const results = assetService.searchAssets(term, {
+    const results = await assetService.searchAssets(term, {
       extensions: ['.png', '.jpg', '.jpeg'],
       maxResults: 20,
       useGlob: false,
@@ -513,22 +447,16 @@ router.get('/player-avatar', publicAssetLimiter, (req: Request, res: Response) =
     }
   }
 
-  // Not found - in demo mode return placeholder
-  if (isDemoMode()) {
-    sendPlaceholderAvatar();
-    return;
-  }
-
   res.status(404).json({ detail: 'Player avatar texture not found in assets' });
 });
 
 // GET /api/assets/player-avatar-search - Debug: Search for player-related textures
-router.get('/player-avatar-search', authMiddleware, requirePermission('assets.view'), (req: Request, res: Response) => {
+router.get('/player-avatar-search', authMiddleware, requirePermission('assets.view'), async (req: Request, res: Response) => {
   const searchTerms = ['character', 'player', 'face', 'head', 'avatar', 'portrait', 'human', 'npc'];
   const allResults: { term: string; paths: string[] }[] = [];
 
   for (const term of searchTerms) {
-    const results = assetService.searchAssets(term, {
+    const results = await assetService.searchAssets(term, {
       extensions: ['.png', '.jpg', '.jpeg'],
       maxResults: 20,
       useGlob: false,
@@ -546,7 +474,7 @@ router.get('/player-avatar-search', authMiddleware, requirePermission('assets.vi
 
 // GET /api/assets/item-icon-search/:itemId - Search for item icon path
 // Returns the path if found, useful for debugging/checking if icon exists
-router.get('/item-icon-search/:itemId', authMiddleware, requirePermission('assets.view'), (req: Request, res: Response) => {
+router.get('/item-icon-search/:itemId', authMiddleware, requirePermission('assets.view'), async (req: Request, res: Response) => {
   const { itemId } = req.params;
 
   if (!itemId) {
@@ -555,7 +483,7 @@ router.get('/item-icon-search/:itemId', authMiddleware, requirePermission('asset
   }
 
   // Search for the item icon
-  const results = assetService.searchAssets(itemId, {
+  const results = await assetService.searchAssets(itemId, {
     extensions: ['.png', '.jpg', '.jpeg'],
     maxResults: 10,
     useGlob: false,
@@ -570,26 +498,13 @@ router.get('/item-icon-search/:itemId', authMiddleware, requirePermission('asset
 
 // GET /api/assets/items - Get list of all available items
 // Returns items with their IDs, display names, and icon paths
-router.get('/items', authMiddleware, requirePermission('assets.view'), (req: Request, res: Response) => {
-  // Demo mode: return demo items
-  if (isDemoMode()) {
-    const items = getDemoItems();
-    const query = (req.query.q as string) || '';
-    if (query) {
-      const filtered = items.filter(i => i.name.toLowerCase().includes(query.toLowerCase()));
-      res.json({ items: filtered, count: filtered.length, query });
-    } else {
-      res.json({ items, count: items.length, total: items.length });
-    }
-    return;
-  }
-
+router.get('/items', authMiddleware, requirePermission('assets.view'), async (req: Request, res: Response) => {
   const query = (req.query.q as string) || '';
   const limit = Math.min(parseInt(req.query.limit as string) || 50, 200);
 
   if (query) {
     // Search items
-    const items = assetService.searchItems(query, limit);
+    const items = await assetService.searchItems(query, limit);
     res.json({
       items,
       count: items.length,
@@ -597,7 +512,7 @@ router.get('/items', authMiddleware, requirePermission('assets.view'), (req: Req
     });
   } else {
     // Return all items
-    const items = assetService.getItemList();
+    const items = await assetService.getItemList();
     res.json({
       items: items.slice(0, limit),
       count: items.length,
@@ -608,14 +523,8 @@ router.get('/items', authMiddleware, requirePermission('assets.view'), (req: Req
 
 // GET /api/assets/debug/structure - Get top-level structure of extracted assets
 // Useful for debugging and finding where icons are located
-router.get('/debug/structure', authMiddleware, requirePermission('assets.view'), (_req: Request, res: Response) => {
-  // Demo mode: return demo tree structure
-  if (isDemoMode()) {
-    res.json({ structure: getDemoAssetTree(), hint: '[DEMO] Use /api/assets/browse?path=<path> to explore further' });
-    return;
-  }
-
-  const tree = assetService.getAssetTree('', 2);
+router.get('/debug/structure', authMiddleware, requirePermission('assets.view'), async (_req: Request, res: Response) => {
+  const tree = await assetService.getAssetTree('', 2);
 
   if (tree === null) {
     res.status(404).json({ detail: 'Assets not extracted or directory not found' });
@@ -629,14 +538,14 @@ router.get('/debug/structure', authMiddleware, requirePermission('assets.view'),
 });
 
 // GET /api/assets/debug/find-icons - Search for all icon/texture directories
-router.get('/debug/find-icons', authMiddleware, requirePermission('assets.view'), (_req: Request, res: Response) => {
-  const iconPaths = assetService.searchAssets('icon', {
+router.get('/debug/find-icons', authMiddleware, requirePermission('assets.view'), async (_req: Request, res: Response) => {
+  const iconPaths = await assetService.searchAssets('icon', {
     extensions: [],
     maxResults: 50,
     useGlob: false,
   });
 
-  const texturePaths = assetService.searchAssets('texture', {
+  const texturePaths = await assetService.searchAssets('texture', {
     extensions: [],
     maxResults: 50,
     useGlob: false,

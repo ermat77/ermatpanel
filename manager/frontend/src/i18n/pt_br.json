@@ -61,7 +61,7 @@
     "whitelist": "Lista de Permissões",
     "permissions": "Permissões",
     "worlds": "Mundos",
-    "mods": "Mods e Plugins",
+    "mods": "Mods",
     "performance": "Desempenho",
     "configuration": "Configuração",
     "users": "Usuários",
@@ -369,19 +369,17 @@
     }
   },
   "mods": {
-    "title": "Mods e Plugins",
-    "subtitle": "Gerenciar mods e plugins do servidor",
+    "title": "Mods",
+    "subtitle": "Gerenciar mods do servidor",
     "mods": "Mods",
-    "plugins": "Plugins",
     "store": "Loja de Mods",
     "noMods": "Nenhum mod encontrado",
-    "noPlugins": "Nenhum plugin encontrado",
     "noStoreMods": "Nenhum mod disponível na loja",
     "enabled": "Ativado",
     "disabled": "Desativado",
     "active": "ativo",
     "path": "Caminho",
-    "restartNote": "Reinicialização do servidor necessária após ativar/desativar mods ou plugins.",
+    "restartNote": "Reinicialização do servidor necessária após ativar/desativar mods.",
     "upload": "Enviar",
     "confirmDelete": "Realmente deseja excluir \"{name}\"?",
     "confirmUninstall": "Realmente deseja desinstalar \"{name}\"?",
@@ -439,7 +437,7 @@
     "versions": "Versões",
     "description": "Descrição",
     "repository": "Repositório",
-    "stackmartDescription": "Navegue e instale recursos gratuitos do StackMart.org - plugins, mods, scripts e ferramentas.",
+    "stackmartDescription": "Navegue e instale recursos gratuitos do StackMart.org - mods, scripts e ferramentas.",
     "stackmartUnavailable": "API StackMart indisponível. Tente novamente mais tarde.",
     "searchStackMart": "Pesquisar recursos no StackMart...",
     "sortPopular": "Popular",
@@ -869,13 +867,6 @@
       "delete": "Excluir mods",
       "config": "Editar configuração de mods",
       "toggle": "Ativar/desativar mods"
-    },
-    "plugins": {
-      "view": "Ver plugins",
-      "install": "Instalar plugins",
-      "delete": "Excluir plugins",
-      "config": "Editar configuração de plugins",
-      "toggle": "Ativar/desativar plugins"
     },
     "config": {
       "view": "Ver configuração",
@@ -1497,7 +1488,7 @@
       "optionInstall": "Instalar Plugin",
       "optionInstallDesc": "Baixar e instalar o Plugin KyuubiSoft API automaticamente",
       "optionSkip": "Pular Instalacao",
-      "optionSkipDesc": "Pular por agora - voce pode instalar o plugin mais tarde na pagina de Mods & Plugins",
+      "optionSkipDesc": "Pular por agora - voce pode instalar o plugin mais tarde na pagina de Mods",
       "version": "Versao",
       "portInfo": "O plugin usara a porta {port} para comunicacao com o painel",
       "kyuubiPlugin": "Plugin KyuubiSoft API",
@@ -1506,7 +1497,7 @@
       "installing": "Instalando...",
       "installed": "Instalado",
       "skip": "Pular instalacao de plugin",
-      "canInstallLater": "Voce pode instalar plugins a qualquer momento na pagina de Mods & Plugins."
+      "canInstallLater": "Voce pode instalar o plugin a qualquer momento na pagina de Mods."
     },
     "integrations": {
       "title": "Integracoes",

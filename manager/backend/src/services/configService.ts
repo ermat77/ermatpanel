@@ -85,7 +85,8 @@ export interface PanelConfig {
 // Config file location
 // Always points to Docker container path - HytaleServer always runs in Docker
 // Backend accesses this via Docker API (docker exec, docker cp, etc.)
-const DATA_PATH = process.env.DATA_PATH || '/opt/hytale/data';
+// Note: Use HYTALE_CONTAINER_DATA_PATH for container paths when accessing via Docker API
+const DATA_PATH = process.env.HYTALE_CONTAINER_DATA_PATH || process.env.DATA_PATH || '/opt/hytale/data';
 const CONFIG_FILENAME = 'config.json';
 const CONFIG_TEMP_SUFFIX = '.tmp';
 
@@ -140,7 +141,7 @@ export function getDefaultConfig(): PanelConfig {
     },
     assets: {
       extracted: false,
-      path: process.env.ASSETS_PATH || '/opt/hytale/assets',
+      path: process.env.HYTALE_CONTAINER_ASSETS_PATH || process.env.ASSETS_PATH || '/opt/hytale/assets',
     },
     integrations: {
       modtaleApiKey: '',

@@ -463,6 +463,22 @@ export const setupApi = {
     return response.data
   },
 
+  /**
+   * Start server download
+   */
+  async startServerDownload(): Promise<{ success: boolean; error?: string }> {
+    const response = await api.post<{ success: boolean; error?: string }>('/setup/server-download/start')
+    return response.data
+  },
+
+  /**
+   * Get server download status
+   */
+  async getServerDownloadStatus(): Promise<{ downloaded: boolean; hasJar: boolean; hasAssets: boolean }> {
+    const response = await api.get<{ downloaded: boolean; hasJar: boolean; hasAssets: boolean }>('/setup/server-download/check')
+    return response.data
+  },
+
   // ==========================================
   // Phase 3: Server Download Methods
   // ==========================================
@@ -630,6 +646,15 @@ export function subscribeToExtractionProgress(
   onError: (error: string) => void
 ): () => void {
   return createProgressStream('/setup/assets/progress', onProgress, onComplete, onError)
+}
+
+// Server download progress stream
+export function subscribeToServerDownloadProgress(
+  onProgress: (event: ProgressEvent) => void,
+  onComplete: () => void,
+  onError: (error: string) => void
+): () => void {
+  return createProgressStream('/setup/server-download/progress', onProgress, onComplete, onError)
 }
 
 // Server console stream during setup

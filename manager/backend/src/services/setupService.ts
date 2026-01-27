@@ -3,7 +3,6 @@ import path from 'path';
 import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
 import { config, reloadConfigFromFile } from '../config.js';
-import { isDemoMode } from './demoData.js';
 import * as dockerService from './docker.js';
 import { runSystemChecks as runSystemChecksFromService, type SystemCheck, type SystemCheckResult } from './systemCheck.js';
 import { installPlugin as installKyuubiApiPlugin } from './kyuubiApi.js';
@@ -73,6 +72,11 @@ export interface SetupConfig {
   patchline?: 'release' | 'pre-release';
   acceptEarlyPlugins?: boolean;
   disableSentry?: boolean;
+  serverDownload?: {
+    downloaded: boolean;
+    downloadedAt?: string;
+    skipped?: boolean;
+  };
 }
 
 // Partial setup data for step-by-step saving
@@ -118,21 +122,52 @@ export interface DownloadProgress {
   error?: string;
 }
 
+// Server download progress
+export interface ServerDownloadProgress {
+  status: 'idle' | 'downloading-downloader' | 'extracting-downloader' | 'downloading-server' | 'extracting-server' | 'complete' | 'error';
+  currentStep: string;
+  stepProgress: number;
+  overallProgress: number;
+  message: string;
+  error?: string;
+}
+
 // Paths
-const DATA_DIR = config.dataPath;
-const SETUP_CONFIG_FILE = path.join(DATA_DIR, 'setup-config.json');
-const PANEL_CONFIG_FILE = path.join(DATA_DIR, 'panel-config.json');
-const CONFIG_JSON_FILE = path.join(DATA_DIR, 'config.json');
+// Manager-specific files path:
+//   - If HOST_DATA_PATH env var is set: use it (override)
+//   - If running locally: use HOST_DATA_PATH/manager
+//   - If running in Docker: default to /app/data
+// For config.json, we also need to write to game server data path for compatibility
+function getManagerDataPath(): string {
+  if (process.env.HOST_DATA_PATH) {
+    return process.env.HOST_DATA_PATH;
+  }
+  const fs = require('fs');
+  const isInDocker = fs.existsSync('/.dockerenv') || !!process.env.DOCKER_CONTAINER;
+  if (!isInDocker) {
+    const hostDataPath = process.env.HOST_DATA_PATH || '/opt/hytale';
+    return path.join(hostDataPath, 'manager');
+  }
+  return '/app/data';
+}
+
+const MANAGER_DATA_DIR = getManagerDataPath();
+
+console.log('MANAGER_DATA_DIR', MANAGER_DATA_DIR);
+const GAME_DATA_DIR = process.env.HYTALE_CONTAINER_DATA_PATH || process.env.DATA_PATH || '/opt/hytale/data';
+const SETUP_CONFIG_FILE = path.join(MANAGER_DATA_DIR, 'setup-config.json');
+const PANEL_CONFIG_FILE = path.join(MANAGER_DATA_DIR, 'panel-config.json');
+// config.json is written to both locations for compatibility
+const CONFIG_JSON_FILE = path.join(MANAGER_DATA_DIR, 'config.json');
+const GAME_CONFIG_JSON_FILE = path.join(GAME_DATA_DIR, 'config.json');
 
 // Step definitions
 const SETUP_STEPS = [
   'system-check',
   'language',
   'admin-account',
-  'download-method',
-  'download',
-  'server-download',
   'assets-extract',
+  'server-download',
   'server-auth',
   'server-config',
   'security-settings',
@@ -163,18 +198,29 @@ let downloadProgress: DownloadProgress = {
   estimatedSeconds: 0,
 };
 
-// Ensure data directory exists
+let serverDownloadProgress: ServerDownloadProgress = {
+  status: 'idle',
+  currentStep: '',
+  stepProgress: 0,
+  overallProgress: 0,
+  message: '',
+};
+
+// Ensure data directories exist
 async function ensureDataDir(): Promise<void> {
   try {
-    await mkdir(DATA_DIR, { recursive: true });
+    await mkdir(MANAGER_DATA_DIR, { recursive: true });
+    // Also ensure game data dir exists for compatibility
+    await mkdir(GAME_DATA_DIR, { recursive: true });
   } catch {
-    // Directory may already exist
+    // Directories may already exist
   }
 }
 
 // Read setup config from file
 async function readSetupConfig(): Promise<SetupConfig> {
   try {
+    console.log('READING SETUP CONFIG FROM', SETUP_CONFIG_FILE);
     const content = await readFile(SETUP_CONFIG_FILE, 'utf-8');
     return JSON.parse(content) as SetupConfig;
   } catch {
@@ -195,14 +241,8 @@ async function writeSetupConfig(setupConfig: SetupConfig): Promise<void> {
 /**
  * Check if setup is complete
  * Returns true if config exists and has setupComplete=true
- * In demo mode, always returns true (setup is skipped)
  */
 export async function isSetupComplete(): Promise<boolean> {
-  // Demo mode: setup is always complete
-  if (isDemoMode()) {
-    return true;
-  }
-
   try {
     const setupConfig = await readSetupConfig();
     return setupConfig.setupComplete === true;
@@ -216,16 +256,6 @@ export async function isSetupComplete(): Promise<boolean> {
  * Returns complete status info including current step and completed steps
  */
 export async function getSetupStatus(): Promise<SetupStatus> {
-  // Demo mode: return completed status
-  if (isDemoMode()) {
-    return {
-      setupComplete: true,
-      currentStep: SETUP_STEPS.length,
-      totalSteps: SETUP_STEPS.length,
-      stepsCompleted: [...SETUP_STEPS],
-    };
-  }
-
   try {
     const setupConfig = await readSetupConfig();
     const stepsCompleted: string[] = [];
@@ -233,11 +263,11 @@ export async function getSetupStatus(): Promise<SetupStatus> {
     // Determine which steps are completed based on config
     if (setupConfig.language) stepsCompleted.push('language');
     if (setupConfig.admin?.username) stepsCompleted.push('admin-account');
-    if (setupConfig.downloadMethod) stepsCompleted.push('download-method');
     if (setupConfig.server) stepsCompleted.push('server-config');
     if (setupConfig.performance) stepsCompleted.push('performance');
     if (setupConfig.automation) stepsCompleted.push('automation');
     if (setupConfig.assets?.extracted) stepsCompleted.push('assets-extract');
+    if (setupConfig.serverDownload !== undefined) stepsCompleted.push('server-download');
     if (setupConfig.plugin !== undefined) stepsCompleted.push('plugin');
     if (setupConfig.integrations) stepsCompleted.push('integrations');
     if (setupConfig.network) stepsCompleted.push('network');
@@ -308,17 +338,6 @@ export async function saveStepData(stepId: string, data: PartialSetupData): Prom
         (setupConfig as any)._adminPasswordHash = await bcrypt.hash(data.password as string, 12);
         break;
 
-      case 'download-method':
-        if (!data.method || !['official', 'custom', 'manual'].includes(data.method as string)) {
-          return { success: false, nextStep: stepId, error: 'Invalid download method' };
-        }
-        setupConfig.downloadMethod = data.method as 'official' | 'custom' | 'manual';
-        setupConfig.autoUpdate = data.autoUpdate === true;
-        if (data.customUrls) {
-          (setupConfig as any)._customUrls = data.customUrls;
-        }
-        break;
-
       case 'server-config':
         // Frontend sends 'name' and 'gameMode', support both naming conventions
         setupConfig.server = {
@@ -369,7 +388,15 @@ export async function saveStepData(stepId: string, data: PartialSetupData): Prom
         setupConfig.assets = {
           extracted: data.extract === true,
           extractedAt: data.extract === true ? new Date().toISOString() : undefined,
-          path: data.extract === true ? config.assetsPath : undefined,
+          path: data.extract === true ? config.hytaleContainerAssetsPath : undefined,
+        };
+        break;
+
+      case 'server-download':
+        setupConfig.serverDownload = {
+          downloaded: data.download === true,
+          downloadedAt: data.download === true ? new Date().toISOString() : undefined,
+          skipped: data.skip === true,
         };
         break;
 
@@ -402,26 +429,6 @@ export async function saveStepData(stepId: string, data: PartialSetupData): Prom
 
       case 'system-check':
         // System check doesn't store data, just validates
-        break;
-
-      case 'download':
-        // Download progress is handled separately
-        break;
-
-      case 'server-download':
-        // Server download step - stores download method, patchline and auto-update preference
-        if (data.method) {
-          setupConfig.downloadMethod = data.method as 'official' | 'custom' | 'manual';
-        }
-        if (data.patchline) {
-          setupConfig.patchline = data.patchline as 'release' | 'pre-release';
-        }
-        if (data.autoUpdate !== undefined) {
-          setupConfig.autoUpdate = data.autoUpdate === true;
-        }
-        if (data.customUrls) {
-          (setupConfig as any)._customUrls = data.customUrls;
-        }
         break;
 
       case 'server-auth':
@@ -558,7 +565,7 @@ export async function finalizeSetup(): Promise<{ success: boolean; error?: strin
     try {
       // We need to create the user with the pre-hashed password
       // Since createUser hashes the password, we'll write directly to users.json
-      const usersFile = path.join(DATA_DIR, 'users.json');
+      const usersFile = path.join(MANAGER_DATA_DIR, 'users.json');
       const usersData = {
         users: [{
           username: setupConfig.admin.username,
@@ -586,10 +593,10 @@ export async function finalizeSetup(): Promise<{ success: boolean; error?: strin
 
     // Write server config.json if server path exists
     if (setupConfig.server) {
-      const serverConfigPath = path.join(config.serverPath, 'config.json');
+      const serverConfigPath = path.join(config.hytaleContainerServerPath, 'config.json');
       try {
         // Check if server directory exists
-        await access(config.serverPath, constants.W_OK);
+        await access(config.hytaleContainerServerPath, constants.W_OK);
 
         // Read existing config or create new
         let serverConfig: any = {};
@@ -664,7 +671,12 @@ export async function finalizeSetup(): Promise<{ success: boolean; error?: strin
       automation: setupConfig.automation ?? null,
       plugin: setupConfig.plugin ?? null,
     };
+    // Write config.json to manager data directory (primary location)
     await writeFile(CONFIG_JSON_FILE, JSON.stringify(mainConfig, null, 2), 'utf-8');
+    // Also write to game data directory for backward compatibility (if different)
+    if (CONFIG_JSON_FILE !== GAME_CONFIG_JSON_FILE) {
+      await writeFile(GAME_CONFIG_JSON_FILE, JSON.stringify(mainConfig, null, 2), 'utf-8');
+    }
     console.log('[Setup] Wrote config.json with all settings');
 
     // Install KyuubiAPI plugin if user selected it
@@ -690,7 +702,7 @@ export async function finalizeSetup(): Promise<{ success: boolean; error?: strin
         if (webmapResult.success) {
           console.log('[Setup] EasyWebMap plugin installed successfully:', webmapResult.filename);
           if (webmapResult.configCreated) {
-            console.log('[Setup] EasyWebMap config created at', path.join(config.modsPath, 'cryptobench_EasyWebMap/config.json'));
+            console.log('[Setup] EasyWebMap config created at', path.join(config.hytaleContainerModsPath, 'cryptobench_EasyWebMap/config.json'));
             // Give filesystem time to sync the config file before server restart
             await new Promise(resolve => setTimeout(resolve, 500));
             console.log('[Setup] EasyWebMap config write confirmed');
@@ -793,7 +805,7 @@ export function setExtractionProgress(progress: Partial<ExtractionProgress>): vo
  */
 export async function startAssetsExtraction(): Promise<{ success: boolean; error?: string }> {
   try {
-    const assetsZipPath = path.join(config.serverPath, 'Assets.zip');
+    const assetsZipPath = path.join(config.hytaleContainerServerPath, 'Assets.zip');
 
     // Check if Assets.zip exists
     try {
@@ -820,18 +832,18 @@ export async function startAssetsExtraction(): Promise<{ success: boolean; error
 
     // Start extraction in background via Docker exec
     // The actual extraction would be done by the game container or a worker
-    const extractPath = config.assetsPath;
+    const extractPath = config.hytaleContainerAssetsPath;
 
     // Ensure extract directory exists
     await mkdir(extractPath, { recursive: true }).catch(() => {});
 
     // Run unzip via docker exec (in the game container which has the tools)
-    dockerService.execInContainer(
+    dockerService.execInGameServerContainer(
       `unzip -o "${assetsZipPath}" -d "${extractPath}" 2>&1`
     ).then(async (result) => {
       if (result.success) {
         // Get directory size
-        const sizeResult = await dockerService.execInContainer(
+        const sizeResult = await dockerService.execInGameServerContainer(
           `du -sb "${extractPath}" | cut -f1`
         );
         const sizeBytes = sizeResult.success && sizeResult.output
@@ -893,6 +905,132 @@ export function getDownloadProgress(): DownloadProgress {
  */
 export function setDownloadProgress(progress: Partial<DownloadProgress>): void {
   downloadProgress = { ...downloadProgress, ...progress };
+}
+
+/**
+ * Get server download progress
+ */
+export function getServerDownloadProgress(): ServerDownloadProgress {
+  return { ...serverDownloadProgress };
+}
+
+/**
+ * Set server download progress (called by download process)
+ */
+export function setServerDownloadProgress(progress: Partial<ServerDownloadProgress>): void {
+  serverDownloadProgress = { ...serverDownloadProgress, ...progress };
+}
+
+/**
+ * Start server download process
+ * Uses the separated hytaleDownloader and serverFileDownloader services
+ */
+export async function startServerDownload(): Promise<{ success: boolean; error?: string }> {
+  try {
+    console.log('[SetupService] Starting server download process...');
+
+    // Import here to avoid circular dependency
+    const { installDownloader } = await import('./hytaleDownloader.js');
+    const { downloadAndExtractServerFiles } = await import('./serverFileDownloader.js');
+
+    // Progress callback to update setup service progress
+    const onProgress = (progress: {
+      step: string;
+      stepProgress: number;
+      overallProgress: number;
+      message: string;
+    }) => {
+      // Map step names to status values
+      let status: ServerDownloadProgress['status'] = 'idle';
+      if (progress.step === 'downloading-downloader') {
+        status = 'downloading-downloader';
+      } else if (progress.step === 'extracting-downloader') {
+        status = 'extracting-downloader';
+      } else if (progress.step === 'downloading-server') {
+        status = 'downloading-server';
+      } else if (progress.step === 'extracting-server') {
+        status = 'extracting-server';
+      } else if (progress.step === 'complete') {
+        status = 'complete';
+      }
+
+      setServerDownloadProgress({
+        status,
+        currentStep: progress.step,
+        stepProgress: progress.stepProgress,
+        overallProgress: progress.overallProgress,
+        message: progress.message,
+      });
+    };
+
+    // Step 1: Install downloader (download and extract)
+    setServerDownloadProgress({
+      status: 'downloading-downloader',
+      currentStep: 'downloading-downloader',
+      stepProgress: 0,
+      overallProgress: 0,
+      message: 'Starting downloader installation...',
+    });
+
+    const downloaderResult = await installDownloader(onProgress);
+    if (!downloaderResult.success) {
+      setServerDownloadProgress({
+        status: 'error',
+        currentStep: 'downloading-downloader',
+        stepProgress: 0,
+        overallProgress: 0,
+        message: 'Failed to install downloader',
+        error: downloaderResult.error,
+      });
+      return { success: false, error: downloaderResult.error };
+    }
+
+    // Step 2: Download and extract server files
+    const serverFilesResult = await downloadAndExtractServerFiles(undefined, onProgress);
+    if (!serverFilesResult.success) {
+      setServerDownloadProgress({
+        status: 'error',
+        currentStep: 'downloading-server',
+        stepProgress: 0,
+        overallProgress: 50,
+        message: 'Failed to download server files',
+        error: serverFilesResult.error,
+      });
+      return { success: false, error: serverFilesResult.error };
+    }
+
+    // Success!
+    setServerDownloadProgress({
+      status: 'complete',
+      currentStep: 'complete',
+      stepProgress: 100,
+      overallProgress: 100,
+      message: 'Server download and extraction completed successfully',
+    });
+
+    // Update setup config
+    const setupConfig = await readSetupConfig();
+    setupConfig.serverDownload = {
+      downloaded: true,
+      skipped: false,
+      downloadedAt: new Date().toISOString(),
+    };
+    await writeSetupConfig(setupConfig);
+
+    console.log('[SetupService] Server download process completed successfully');
+    return { success: true };
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    setServerDownloadProgress({
+      status: 'error',
+      currentStep: 'error',
+      stepProgress: 0,
+      overallProgress: 0,
+      message: 'Server download failed',
+      error: errorMessage,
+    });
+    return { success: false, error: errorMessage };
+  }
 }
 
 /**

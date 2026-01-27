@@ -381,10 +381,10 @@ export async function isModInstalled(modId: string, registry?: ModStoreEntry[]):
     return { installed: false };
   }
 
-  const { readdir } = await import('fs/promises');
+  const { readServerDir } = await import('../utils/fileAccess.js');
 
   try {
-    const files = await readdir(config.modsPath);
+    const files = await readServerDir(config.hytaleContainerModsPath, 'mods');
 
     // Check for mod file (case-insensitive search)
     for (const file of files) {
@@ -462,13 +462,13 @@ export async function installMod(modId: string): Promise<InstallResult> {
 
   // Ensure mods directory exists
   try {
-    await access(config.modsPath);
+    await access(config.hytaleContainerModsPath);
   } catch {
-    await mkdir(config.modsPath, { recursive: true });
+    await mkdir(config.hytaleContainerModsPath, { recursive: true });
   }
 
   // Download the JAR
-  const destPath = path.join(config.modsPath, filename);
+  const destPath = path.join(config.hytaleContainerModsPath, filename);
   const downloaded = await downloadFile(downloadUrl, destPath);
 
   if (!downloaded) {
@@ -480,7 +480,7 @@ export async function installMod(modId: string): Promise<InstallResult> {
   if (mod.configTemplate && mod.configPath) {
     try {
       // Config path is relative to modsPath (where the JAR is installed)
-      const configFullPath = path.join(config.modsPath, mod.configPath);
+      const configFullPath = path.join(config.hytaleContainerModsPath, mod.configPath);
       const configDir = path.dirname(configFullPath);
 
       // Create a copy of the template and apply dynamic port values
@@ -534,7 +534,7 @@ export async function uninstallMod(modId: string): Promise<{ success: boolean; e
   const { unlink } = await import('fs/promises');
 
   try {
-    await unlink(path.join(config.modsPath, installed.filename));
+    await unlink(path.join(config.hytaleContainerModsPath, installed.filename));
     return { success: true };
   } catch (e) {
     return { success: false, error: 'Failed to delete mod file' };
@@ -641,14 +641,14 @@ export async function updateMod(modId: string): Promise<InstallResult> {
 
   // Delete old version
   try {
-    await unlink(path.join(config.modsPath, installed.filename));
+    await unlink(path.join(config.hytaleContainerModsPath, installed.filename));
   } catch (e) {
     console.error('Failed to delete old mod file:', e);
     // Continue anyway - download new version
   }
 
   // Download new version
-  const destPath = path.join(config.modsPath, filename);
+  const destPath = path.join(config.hytaleContainerModsPath, filename);
   const downloaded = await downloadFile(downloadUrl, destPath);
 
   if (!downloaded) {
@@ -733,7 +733,7 @@ export function getRegistryInfo(): { url: string; cached: boolean; cacheAge?: nu
  * This can be called after server startup to fix config if mod created default
  */
 export async function ensureEasyWebMapConfig(): Promise<{ success: boolean; created: boolean; updated: boolean; error?: string }> {
-  const configPath = path.join(config.modsPath, 'cryptobench_EasyWebMap/config.json');
+  const configPath = path.join(config.hytaleContainerModsPath, 'cryptobench_EasyWebMap/config.json');
   const expectedPort = config.webMapPort;
 
   console.log(`[ModStore] ensureEasyWebMapConfig: checking ${configPath}, expected port: ${expectedPort}`);

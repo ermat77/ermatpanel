@@ -2,6 +2,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { config } from '../config.js';
 import { execCommand, getLogs } from './docker.js';
+import * as fileAccess from '../utils/fileAccess.js';
 import type { ActionResponse } from '../types/index.js';
 
 export interface HytaleAuthStatus {
@@ -26,7 +27,26 @@ export interface HytaleDeviceCodeResponse {
   error?: string;
 }
 
-const AUTH_STATUS_FILE = path.join(config.dataPath, 'hytale-auth.json');
+// AUTH_STATUS_FILE is for backend's own status (not in game server container)
+// Manager-specific files path:
+//   - If HOST_DATA_PATH env var is set: use it (override)
+//   - If running locally: use HOST_DATA_PATH/manager
+//   - If running in Docker: default to /app/data
+function getManagerDataPath(): string {
+  if (process.env.HOST_DATA_PATH) {
+    return process.env.HOST_DATA_PATH;
+  }
+  const fs = require('fs');
+  const isInDocker = fs.existsSync('/.dockerenv') || !!process.env.DOCKER_CONTAINER;
+  if (!isInDocker) {
+    const hostDataPath = process.env.HOST_DATA_PATH || '/opt/hytale';
+    return path.join(hostDataPath, 'manager');
+  }
+  return '/app/data';
+}
+
+const DATA_DIR = getManagerDataPath();
+const AUTH_STATUS_FILE = path.join(DATA_DIR, 'hytale-auth.json');
 
 /**
  * Reads the Hytale authentication status from disk
@@ -45,7 +65,7 @@ export async function getAuthStatus(): Promise<HytaleAuthStatus> {
  */
 export async function saveAuthStatus(status: HytaleAuthStatus): Promise<void> {
   try {
-    await fs.mkdir(config.dataPath, { recursive: true });
+    await fs.mkdir(DATA_DIR, { recursive: true });
     await fs.writeFile(AUTH_STATUS_FILE, JSON.stringify(status, null, 2));
   } catch (error) {
     console.error('Failed to save Hytale auth status:', error);
@@ -234,29 +254,31 @@ export async function initiateDeviceLogin(): Promise<HytaleDeviceCodeResponse> {
 /**
  * Gets the base Hytale path (parent of serverPath)
  * e.g., if serverPath is /opt/hytale/server, returns /opt/hytale
+ * Uses container paths
  */
 function getHytaleBasePath(): string {
-  return path.dirname(config.serverPath);
+  return path.dirname(config.hytaleContainerServerPath);
 }
 
 /**
  * Lists all files in the auth directories
  * Checks both /opt/hytale/auth and /opt/hytale/server/auth
+ * Always uses Docker API with container paths
  */
 export async function listAuthFiles(): Promise<string[]> {
   const allFiles: string[] = [];
   const basePath = getHytaleBasePath();
 
-  // Check auth directories at different locations
+  // Check auth directories at different locations (container paths)
   const authDirs = [
-    path.join(basePath, 'auth'),           // /opt/hytale/auth (main auth folder)
-    path.join(config.serverPath, 'auth'),  // /opt/hytale/server/auth
-    path.join(config.serverPath, '.auth'), // /opt/hytale/server/.auth
+    path.posix.join(basePath, 'auth'),                          // /opt/hytale/auth (main auth folder)
+    path.posix.join(config.hytaleContainerServerPath, 'auth'),  // /opt/hytale/server/auth
+    path.posix.join(config.hytaleContainerServerPath, '.auth'), // /opt/hytale/server/.auth
   ];
 
   for (const authDir of authDirs) {
     try {
-      const files = await fs.readdir(authDir);
+      const files = await fileAccess.readServerDir(authDir);
       console.log(`[HytaleAuth] Files in ${authDir}:`, files);
       allFiles.push(...files);
     } catch {
@@ -277,10 +299,12 @@ export async function listAuthFiles(): Promise<string[]> {
  */
 export async function inspectDownloaderCredentials(): Promise<{ exists: boolean; structure?: any; error?: string }> {
   try {
-    const downloaderCredsPath = '/opt/hytale/downloader/.hytale-downloader-credentials.json';
+    // Use container path - construct from base path
+    const basePath = getHytaleBasePath();
+    const downloaderCredsPath = path.posix.join(basePath, 'downloader', '.hytale-downloader-credentials.json');
 
     try {
-      const content = await fs.readFile(downloaderCredsPath, 'utf-8');
+      const content = await fileAccess.readServerFile(downloaderCredsPath);
       const parsed = JSON.parse(content);
 
       // Return structure without exposing sensitive values
@@ -331,43 +355,45 @@ async function checkTokenFileExists(): Promise<boolean> {
 
     const basePath = getHytaleBasePath();
 
-    // Try common token file locations
+    // Try common token file locations (container paths)
     const possiblePaths = [
       // Main auth folder at /opt/hytale/auth (same level as server)
-      path.join(basePath, 'auth', 'credentials.json'),
-      path.join(basePath, 'auth', 'oauth_credentials.json'),
-      path.join(basePath, 'auth', 'credentials.enc'),
-      path.join(basePath, 'auth', 'auth.enc'),
-      path.join(basePath, 'auth', 'token'),
-      path.join(basePath, 'auth', 'oauth_token'),
+      path.posix.join(basePath, 'auth', 'credentials.json'),
+      path.posix.join(basePath, 'auth', 'oauth_credentials.json'),
+      path.posix.join(basePath, 'auth', 'credentials.enc'),
+      path.posix.join(basePath, 'auth', 'auth.enc'),
+      path.posix.join(basePath, 'auth', 'token'),
+      path.posix.join(basePath, 'auth', 'oauth_token'),
       // Root server folder
-      path.join(config.serverPath, 'auth.enc'),
-      path.join(config.serverPath, '.hytale_token'),
-      path.join(config.serverPath, 'auth_token'),
-      path.join(config.serverPath, 'oauth_token.json'),
-      path.join(config.serverPath, 'oauth_credentials.json'),
-      path.join(config.serverPath, '.oauth_token'),
+      path.posix.join(config.hytaleContainerServerPath, 'auth.enc'),
+      path.posix.join(config.hytaleContainerServerPath, '.hytale_token'),
+      path.posix.join(config.hytaleContainerServerPath, 'auth_token'),
+      path.posix.join(config.hytaleContainerServerPath, 'oauth_token.json'),
+      path.posix.join(config.hytaleContainerServerPath, 'oauth_credentials.json'),
+      path.posix.join(config.hytaleContainerServerPath, '.oauth_token'),
       // Config folder
-      path.join(config.serverPath, 'config', 'auth_token'),
-      path.join(config.serverPath, 'config', 'oauth_token.json'),
+      path.posix.join(config.hytaleContainerServerPath, 'config', 'auth_token'),
+      path.posix.join(config.hytaleContainerServerPath, 'config', 'oauth_token.json'),
       // 'auth' subfolder in server
-      path.join(config.serverPath, 'auth', 'credentials.json'),
-      path.join(config.serverPath, 'auth', 'oauth_credentials.json'),
-      path.join(config.serverPath, 'auth', 'credentials.enc'),
-      path.join(config.serverPath, 'auth', 'auth.enc'),
+      path.posix.join(config.hytaleContainerServerPath, 'auth', 'credentials.json'),
+      path.posix.join(config.hytaleContainerServerPath, 'auth', 'oauth_credentials.json'),
+      path.posix.join(config.hytaleContainerServerPath, 'auth', 'credentials.enc'),
+      path.posix.join(config.hytaleContainerServerPath, 'auth', 'auth.enc'),
       // '.auth' subfolder in server
-      path.join(config.serverPath, '.auth', 'credentials.json'),
-      path.join(config.serverPath, '.auth', 'oauth_credentials.json'),
-      path.join(config.serverPath, '.auth', 'credentials.enc'),
-      path.join(config.serverPath, '.auth', 'auth.enc'),
+      path.posix.join(config.hytaleContainerServerPath, '.auth', 'credentials.json'),
+      path.posix.join(config.hytaleContainerServerPath, '.auth', 'oauth_credentials.json'),
+      path.posix.join(config.hytaleContainerServerPath, '.auth', 'credentials.enc'),
+      path.posix.join(config.hytaleContainerServerPath, '.auth', 'auth.enc'),
     ];
 
     for (const tokenPath of possiblePaths) {
       try {
-        await fs.access(tokenPath);
-        // File exists
-        console.log(`[HytaleAuth] Found Hytale auth token at: ${tokenPath}`);
-        return true;
+        const stats = await fileAccess.getServerFileStats(tokenPath);
+        if (stats) {
+          // File exists
+          console.log(`[HytaleAuth] Found Hytale auth token at: ${tokenPath}`);
+          return true;
+        }
       } catch {
         // File doesn't exist, try next
         continue;
@@ -399,26 +425,29 @@ export async function checkAuthCompletion(): Promise<ActionResponse> {
 
     // Check for REAL server token files (auth.enc)
     // These are created by /auth persistence Encrypted AFTER successful auth
+    // Always use Docker API with container paths
     const serverTokenPaths = [
-      path.join(basePath, 'auth', 'auth.enc'),
-      path.join(config.serverPath, '.auth', 'auth.enc'),
-      path.join(config.serverPath, 'auth.enc'),
+      path.posix.join(basePath, 'auth', 'auth.enc'),
+      path.posix.join(config.hytaleContainerServerPath, '.auth', 'auth.enc'),
+      path.posix.join(config.hytaleContainerServerPath, 'auth.enc'),
     ];
 
     for (const tokenPath of serverTokenPaths) {
       try {
-        await fs.access(tokenPath);
-        console.log(`[HytaleAuth] Found server auth token at: ${tokenPath}`);
-        await saveAuthStatus({
-          authenticated: true,
-          persistent: true,
-          persistenceType: 'disk',
-          lastChecked: Date.now(),
-        });
-        return {
-          success: true,
-          message: 'Server is authenticated.',
-        };
+        const stats = await fileAccess.getServerFileStats(tokenPath);
+        if (stats) {
+          console.log(`[HytaleAuth] Found server auth token at: ${tokenPath}`);
+          await saveAuthStatus({
+            authenticated: true,
+            persistent: true,
+            persistenceType: 'disk',
+            lastChecked: Date.now(),
+          });
+          return {
+            success: true,
+            message: 'Server is authenticated.',
+          };
+        }
       } catch {
         // File doesn't exist, continue
       }
@@ -460,18 +489,20 @@ export async function checkAuthCompletion(): Promise<ActionResponse> {
           // Verify auth.enc was created
           for (const tokenPath of serverTokenPaths) {
             try {
-              await fs.access(tokenPath);
-              console.log(`[HytaleAuth] Persistence successful - auth.enc created at: ${tokenPath}`);
-              await saveAuthStatus({
-                authenticated: true,
-                persistent: true,
-                persistenceType: 'disk',
-                lastChecked: Date.now(),
-              });
-              return {
-                success: true,
-                message: 'Server is authenticated and credentials saved to disk.',
-              };
+              const stats = await fileAccess.getServerFileStats(tokenPath);
+              if (stats) {
+                console.log(`[HytaleAuth] Persistence successful - auth.enc created at: ${tokenPath}`);
+                await saveAuthStatus({
+                  authenticated: true,
+                  persistent: true,
+                  persistenceType: 'disk',
+                  lastChecked: Date.now(),
+                });
+                return {
+                  success: true,
+                  message: 'Server is authenticated and credentials saved to disk.',
+                };
+              }
             } catch {
               // Continue checking
             }
@@ -565,16 +596,18 @@ export async function checkAuthCompletion(): Promise<ActionResponse> {
  */
 async function checkDownloaderCredentialsExist(): Promise<boolean> {
   const basePath = getHytaleBasePath();
-  const credPaths = [
-    path.join(basePath, 'auth', 'credentials.json'),
-    path.join(basePath, 'auth', 'oauth_credentials.json'),
-    path.join(basePath, 'downloader', '.hytale-downloader-credentials.json'),
-  ];
+    const credPaths = [
+      path.posix.join(basePath, 'auth', 'credentials.json'),
+      path.posix.join(basePath, 'auth', 'oauth_credentials.json'),
+      path.posix.join(basePath, 'downloader', '.hytale-downloader-credentials.json'),
+    ];
 
   for (const credPath of credPaths) {
     try {
-      await fs.access(credPath);
-      return true;
+      const stats = await fileAccess.getServerFileStats(credPath);
+      if (stats) {
+        return true;
+      }
     } catch {
       // Continue checking
     }

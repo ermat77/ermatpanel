@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import rateLimit from 'express-rate-limit';
+import path from 'path';
 import {
   isSetupComplete,
   getSetupStatus,
@@ -8,6 +9,8 @@ import {
   getExtractionProgress,
   startAssetsExtraction,
   getDownloadProgress,
+  getServerDownloadProgress,
+  startServerDownload,
   getAuthStatusForSetup,
   resetSetup,
 } from '../services/setupService.js';
@@ -784,8 +787,8 @@ router.get('/download/verify', async (_req: Request, res: Response) => {
     const fs = await import('fs/promises');
     const path = await import('path');
 
-    const serverJarPath = path.join(config.serverPath, 'HytaleServer.jar');
-    const assetsZipPath = path.join(config.serverPath, 'Assets.zip');
+    const serverJarPath = path.join(config.hytaleContainerServerPath, 'HytaleServer.jar');
+    const assetsZipPath = path.join(config.hytaleContainerServerPath, 'Assets.zip');
 
     let serverJarSize = '0 B';
     let serverJarIntegrity = false;
@@ -1151,6 +1154,128 @@ router.get('/assets/status', assetsProgressHandler);
 router.get('/assets/progress', assetsProgressHandler);
 
 /**
+ * POST /api/setup/server-download/start
+ * Start server download process
+ *
+ * Response:
+ * { success: boolean, message?: string, error?: string }
+ */
+router.post('/server-download/start', async (_req: Request, res: Response) => {
+  try {
+    // Check if setup is already complete
+    const complete = await isSetupComplete();
+    if (complete) {
+      res.status(400).json({
+        success: false,
+        error: 'Setup is already complete',
+      });
+      return;
+    }
+
+    const result = await startServerDownload();
+
+    if (!result.success) {
+      res.status(400).json(result);
+      return;
+    }
+
+    res.json({
+      success: true,
+      message: 'Server download started',
+    });
+  } catch (error) {
+    console.error('[Setup] Failed to start server download:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to start server download',
+      detail: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+});
+
+/**
+ * GET /api/setup/server-download/status
+ * Server-Sent Events endpoint for server download progress
+ *
+ * Response: SSE stream with ServerDownloadProgress objects
+ */
+const serverDownloadProgressHandler = (req: Request, res: Response) => {
+  // Set headers for SSE
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
+
+  // Send initial status
+  const sendStatus = () => {
+    const progress = getServerDownloadProgress();
+
+    // Map status to type for frontend compatibility
+    const type = progress.status === 'complete' ? 'complete'
+      : progress.status === 'error' ? 'error'
+      : 'progress';
+
+    // Send response with both status (backend) and type (frontend) fields
+    const response = {
+      ...progress,
+      type,
+    };
+
+    res.write(`data: ${JSON.stringify(response)}\n\n`);
+
+    // If download is complete or errored, close the connection after a short delay
+    if (progress.status === 'complete' || progress.status === 'error') {
+      setTimeout(() => {
+        clearInterval(interval);
+        res.end();
+      }, 1000);
+    }
+  };
+
+  // Send status immediately
+  sendStatus();
+
+  // Send updates every second
+  const interval = setInterval(sendStatus, 1000);
+
+  // Clean up on connection close
+  req.on('close', () => {
+    clearInterval(interval);
+  });
+};
+
+// Both endpoints point to the same handler (frontend uses /progress, legacy uses /status)
+router.get('/server-download/status', serverDownloadProgressHandler);
+router.get('/server-download/progress', serverDownloadProgressHandler);
+
+/**
+ * GET /api/setup/server-download/check
+ * Check if server files are already downloaded
+ *
+ * Response:
+ * { downloaded: boolean, hasJar: boolean, hasAssets: boolean }
+ */
+router.get('/server-download/check', async (_req: Request, res: Response) => {
+  try {
+    const { checkServerFilesInstalled } = await import('../services/serverFileDownloader.js');
+    const result = await checkServerFilesInstalled();
+    res.json({
+      downloaded: result.installed,
+      hasJar: result.hasJar,
+      hasAssets: result.hasAssets,
+    });
+  } catch (error) {
+    console.error('[Setup] Failed to check server download status:', error);
+    res.status(500).json({
+      downloaded: false,
+      hasJar: false,
+      hasAssets: false,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+});
+
+/**
  * GET /api/setup/detect-ip
  * Detect the server's local IP address for LAN access
  *
@@ -1230,8 +1355,8 @@ router.get('/server-info', async (_req: Request, res: Response) => {
       managerPort: config.externalPort,
       serverPort: config.serverPort,
       gameContainerName: config.gameContainerName,
-      serverPath: config.serverPath,
-      dataPath: config.dataPath,
+      serverPath: config.hytaleContainerServerPath,
+      dataPath: config.hytaleContainerDataPath,
       hostDataPath: config.hostDataPath,
     });
   } catch (error) {

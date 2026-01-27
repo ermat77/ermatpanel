@@ -6,7 +6,6 @@ import {
   type SetupStatus,
   type AdminAccountData,
   type LanguageData,
-  type DownloadMethodData,
   type ServerAuthData,
   type ServerConfigData,
   type SecuritySettingsData,
@@ -50,17 +49,18 @@ export const SETUP_STEPS: SetupStep[] = [
     required: true,
   },
   {
-    id: 'download-method',
-    title: 'Server Download',
-    titleKey: 'setup.steps.downloadMethod',
-    component: 'ServerDownload',
-    required: true,
-  },
-  {
     id: 'assets-extract',
     title: 'Asset Extraction',
     titleKey: 'setup.steps.assetsExtract',
     component: 'AssetsExtract',
+    required: false,
+    skippable: true,
+  },
+  {
+    id: 'server-download',
+    title: 'Server Download',
+    titleKey: 'setup.steps.serverDownload',
+    component: 'ServerDownload',
     required: false,
     skippable: true,
   },
@@ -145,9 +145,12 @@ export interface SetupData {
   } | null
   language: LanguageData | null
   admin: AdminAccountData | null
-  downloadMethod: DownloadMethodData | null
   assetsExtract: {
     extracted: boolean
+    skipped: boolean
+  } | null
+  serverDownload: {
+    downloaded: boolean
     skipped: boolean
   } | null
   serverAuth: ServerAuthData | null
@@ -175,8 +178,8 @@ export const useSetupStore = defineStore('setup', () => {
     systemCheck: null,
     language: null,
     admin: null,
-    downloadMethod: null,
     assetsExtract: null,
+    serverDownload: null,
     serverAuth: null,
     serverConfig: null,
     securitySettings: null,
@@ -225,10 +228,10 @@ export const useSetupStore = defineStore('setup', () => {
         return !!setupData.value.language?.language
       case 'admin-account':
         return !!(setupData.value.admin?.username && setupData.value.admin?.password)
-      case 'download-method':
-        return !!(setupData.value.downloadMethod?.method && setupData.value.downloadMethod?.completed)
       case 'assets-extract':
         return setupData.value.assetsExtract?.extracted || setupData.value.assetsExtract?.skipped || false
+      case 'server-download':
+        return setupData.value.serverDownload?.downloaded || setupData.value.serverDownload?.skipped || false
       case 'server-auth':
         return setupData.value.serverAuth?.authenticated ?? false
       case 'server-config':
@@ -342,27 +345,6 @@ export const useSetupStore = defineStore('setup', () => {
       return false
     } catch (err) {
       error.value = err instanceof Error ? err.message : 'Failed to create admin account'
-      return false
-    } finally {
-      isLoading.value = false
-    }
-  }
-
-  async function saveDownloadMethod(data: DownloadMethodData): Promise<boolean> {
-    isLoading.value = true
-    error.value = null
-
-    try {
-      const result = await setupApi.saveDownloadMethod(data)
-      if (result.success) {
-        setupData.value.downloadMethod = data
-        markStepCompleted('download-method')
-        return true
-      }
-      error.value = result.error || 'Failed to save download method'
-      return false
-    } catch (err) {
-      error.value = err instanceof Error ? err.message : 'Failed to save download method'
       return false
     } finally {
       isLoading.value = false
@@ -676,8 +658,8 @@ export const useSetupStore = defineStore('setup', () => {
       systemCheck: null,
       language: null,
       admin: null,
-      downloadMethod: null,
       assetsExtract: null,
+      serverDownload: null,
       serverAuth: null,
       serverConfig: null,
       securitySettings: null,
@@ -714,7 +696,6 @@ export const useSetupStore = defineStore('setup', () => {
     runSystemCheck,
     saveLanguage,
     createAdmin,
-    saveDownloadMethod,
     saveAssetsExtract,
     saveServerAuth,
     saveServerConfig,

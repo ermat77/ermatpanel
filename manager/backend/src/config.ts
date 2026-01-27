@@ -31,39 +31,66 @@ if (isDevelopmentMode) {
     console.log(`[Config] ⚠️  No environment variables loaded. Create .env.dev file.`);
   }
 } else {
-  // Production mode: load .env
-  dotenv.config({ path: envPath }); // Load .env
-  console.log(`[Config] 📝 Loading .env (production mode)`);
+  // Production mode: load .env if it exists
+  // In Docker, env vars are passed via docker-compose environment section,
+  // so .env file is optional (and typically doesn't exist in container)
+  if (fs.existsSync(envPath)) {
+    dotenv.config({ path: envPath }); // Load .env
+    console.log(`[Config] 📝 Loaded .env (production mode)`);
+  } else {
+    // In Docker, env vars come from docker-compose environment section
+    // No .env file needed - this is expected and normal
+    console.log(`[Config] 📝 Production mode - using environment variables from container`);
+  }
 }
 
 // ============================================================
-// Local Development Detection
+// Backend Docker Detection
 // ============================================================
 
 /**
- * Check if the backend itself is running in local development (not in Docker)
+ * Check if the backend itself is running in a Docker container
  * 
  * Note: HytaleServer always runs in Docker container.
- * This function only detects if the backend is local or in Docker.
+ * This function detects if the backend is also in Docker (production) or local (development).
+ * Used for determining plugin host (localhost vs container name).
  */
-function isLocalDevelopment(): boolean {
+export function isBackendInDocker(): boolean {
   // Check if backend is running in Docker container
   // If /.dockerenv exists, we're inside a Docker container
-  const backendInDocker = fs.existsSync('/.dockerenv') || process.env.DOCKER_CONTAINER;
-  
-  // Backend is local if it's NOT in Docker
-  return !backendInDocker;
+  return fs.existsSync('/.dockerenv') || !!process.env.DOCKER_CONTAINER;
 }
 
 // ============================================================
 // Config.json Integration
 // ============================================================
 
-// Path to config.json (same as in configService.ts)
-// Always points to Docker container path - HytaleServer always runs in Docker
-// Backend accesses this via Docker API
-const DATA_PATH = process.env.DATA_PATH || '/opt/hytale/data';
-const CONFIG_FILE_PATH = path.join(DATA_PATH, 'config.json');
+// Path to config.json
+// Manager config files path:
+//   - If HOST_DATA_PATH env var is set: use it (override)
+//   - If running locally: use HOST_DATA_PATH/manager (consistent with game server paths)
+//   - If running in Docker: default to /app/data (Docker volume mount)
+function getManagerDataPath(): string {
+  // If explicitly set via env var, use it (override)
+  if (process.env.HOST_DATA_PATH) {
+    return process.env.HOST_DATA_PATH;
+  }
+  
+  // If running locally (not in Docker), use HOST_DATA_PATH/manager
+  if (!isBackendInDocker()) {
+    const hostDataPath = process.env.HOST_DATA_PATH || '/opt/hytale';
+    return path.join(hostDataPath, 'manager');
+  }
+  
+  // Running in Docker, use container path
+  return '/app/data';
+}
+
+const HOST_DATA_PATH = getManagerDataPath();
+const GAME_DATA_PATH = process.env.HYTALE_CONTAINER_DATA_PATH || process.env.DATA_PATH || '/opt/hytale/data';
+// Try manager data path first, then game data path for backward compatibility
+const CONFIG_FILE_PATH = path.join(HOST_DATA_PATH, 'config.json');
+const CONFIG_FILE_PATH_FALLBACK = path.join(GAME_DATA_PATH, 'config.json');
 
 // Interface for config.json (simplified for this module)
 interface ConfigJson {
@@ -99,12 +126,17 @@ interface ConfigJson {
 }
 
 // Try to load config.json synchronously at startup
+// Check manager data path first, then fall back to game data path for backward compatibility
 let configJson: ConfigJson | null = null;
 try {
   if (fs.existsSync(CONFIG_FILE_PATH)) {
     const content = fs.readFileSync(CONFIG_FILE_PATH, 'utf-8');
     configJson = JSON.parse(content);
-    console.log('[Config] Loaded configuration from config.json');
+    console.log('[Config] Loaded configuration from config.json (manager data)');
+  } else if (fs.existsSync(CONFIG_FILE_PATH_FALLBACK)) {
+    const content = fs.readFileSync(CONFIG_FILE_PATH_FALLBACK, 'utf-8');
+    configJson = JSON.parse(content);
+    console.log('[Config] Loaded configuration from config.json (game data, fallback)');
   }
 } catch (error) {
   console.log('[Config] Could not load config.json, using environment variables');
@@ -131,25 +163,14 @@ const INSECURE_DEFAULTS = {
 // Security mode: 'strict' blocks startup with insecure config, 'warn' only logs warnings
 const securityMode = process.env.SECURITY_MODE || 'strict';
 
-// Demo mode: enables the panel to run without a real Hytale server
-// All data is mocked for demonstration purposes
-const demoMode = process.env.DEMO_MODE === 'true' || process.env.DEMO_MODE === '1';
-
 // ============================================================
 // Configuration Object
 // ============================================================
 
 // Determine JWT secret: prefer config.json, then env, then empty
-// In demo mode, auto-generate a secret if none is provided
 const jwtSecretFromConfig = configJson?.jwtSecret;
 const jwtSecretFromEnv = process.env.JWT_SECRET || '';
-let effectiveJwtSecret = jwtSecretFromConfig || jwtSecretFromEnv;
-
-// Auto-generate JWT secret for demo mode if none is configured
-if (demoMode && !effectiveJwtSecret) {
-  effectiveJwtSecret = crypto.randomBytes(48).toString('base64');
-  console.log('[Demo Mode] Auto-generated JWT secret for demo session');
-}
+const effectiveJwtSecret = jwtSecretFromConfig || jwtSecretFromEnv;
 
 // Determine CORS origins: prefer config.json, then env
 const corsFromConfig = configJson?.corsOrigins;
@@ -216,22 +237,20 @@ export const config = {
   // Always points to Docker container path - HytaleServer always runs in Docker
   hostDataPath: process.env.HOST_DATA_PATH || '/opt/hytale',
 
-  // Server file paths
-  // IMPORTANT: HytaleServer always runs in Docker container at /opt/hytale
-  // Backend accesses these paths via Docker API (docker exec, docker cp, etc.)
-  // Container name is 'hytale' (or from GAME_CONTAINER_NAME/STACK_NAME env vars)
-  serverPath: process.env.SERVER_PATH || '/opt/hytale/server',
-  backupsPath: process.env.BACKUPS_PATH || '/opt/hytale/backups',
-  dataPath: process.env.DATA_PATH || '/opt/hytale/data',
-  modsPath: process.env.MODS_PATH || '/opt/hytale/mods',
-  assetsPath: process.env.ASSETS_PATH || '/opt/hytale/assets',
+  // Host downloader path (where downloader is stored on host)
+  hostDownloaderPath: process.env.HOST_DOWNLOADER_PATH || path.join(process.env.HOST_DATA_PATH || '/opt/hytale', 'downloader'),
 
+  // Container paths - ALWAYS use these when accessing via Docker API
+  // These are the paths inside the Hytale server container
   hytaleContainerServerPath: process.env.HYTALE_CONTAINER_SERVER_PATH || '/opt/hytale/server',
   hytaleContainerBackupsPath: process.env.HYTALE_CONTAINER_BACKUPS_PATH || '/opt/hytale/backups',
   hytaleContainerDataPath: process.env.HYTALE_CONTAINER_DATA_PATH || '/opt/hytale/data',
   hytaleContainerModsPath: process.env.HYTALE_CONTAINER_MODS_PATH || '/opt/hytale/mods',
-  hytalecontainerModsPath: process.env.HYTALE_CONTAINER_PLUGINS_PATH || '/opt/hytale/plugins',
+  hytaleContainerPluginsPath: process.env.HYTALE_CONTAINER_PLUGINS_PATH || '/opt/hytale/plugins',
   hytaleContainerAssetsPath: process.env.HYTALE_CONTAINER_ASSETS_PATH || '/opt/hytale/assets',
+  
+  // Hytale downloader URL
+  hytaleDownloaderUrl: process.env.HYTALE_DOWNLOADER_URL || 'https://downloader.hytale.com/hytale-downloader.zip',
 
   // Server port - internal port is always 18080, external port from MANAGER_PORT
   // Internal port is what Express listens on inside the container
@@ -253,13 +272,6 @@ export const config = {
   securityMode,
 
   // ============================================================
-  // Demo Mode
-  // ============================================================
-
-  // Demo mode: run panel without real Hytale server (all data mocked)
-  demoMode,
-
-  // ============================================================
   // Setup state
   // ============================================================
 
@@ -279,8 +291,13 @@ export const config = {
  */
 export function reloadConfigFromFile(): void {
   try {
-    if (fs.existsSync(CONFIG_FILE_PATH)) {
-      const content = fs.readFileSync(CONFIG_FILE_PATH, 'utf-8');
+    // Check manager data path first, then fall back to game data path
+    let configPath = CONFIG_FILE_PATH;
+    if (!fs.existsSync(configPath)) {
+      configPath = CONFIG_FILE_PATH_FALLBACK;
+    }
+    if (fs.existsSync(configPath)) {
+      const content = fs.readFileSync(configPath, 'utf-8');
       const newConfigJson = JSON.parse(content) as ConfigJson;
 
       // Update mutable config values
@@ -325,28 +342,9 @@ export function reloadConfigFromFile(): void {
  * security validation is skipped as credentials are managed differently.
  */
 export function checkSecurityConfig(): void {
-  // Skip security checks in demo mode
-  // Demo mode auto-generates JWT secret and uses mock credentials
-  if (config.demoMode) {
-    console.log('\n');
-    console.log('╔══════════════════════════════════════════════════════════════╗');
-    console.log('║                   🎮 DEMO MODE 🎮                             ║');
-    console.log('╠══════════════════════════════════════════════════════════════╣');
-    console.log('║  Running in demonstration mode with simulated data.          ║');
-    console.log('║  No real server connection required.                         ║');
-    console.log('║                                                              ║');
-    console.log('║  Demo accounts available:                                    ║');
-    console.log('║    • Viewer: demo / demo                                     ║');
-    console.log('║    • Admin:  admin / admin                                   ║');
-    console.log('║                                                              ║');
-    console.log(`║  Open: http://localhost:${config.externalPort.toString().padEnd(38)}║`);
-    console.log('╚══════════════════════════════════════════════════════════════╝');
-    console.log('\n');
-    return;
-  }
-
   // Check if config.json exists (regardless of setupComplete status)
-  const configJsonExists = fs.existsSync(CONFIG_FILE_PATH);
+  // Check manager data path first, then fall back to game data path
+  const configJsonExists = fs.existsSync(CONFIG_FILE_PATH) || fs.existsSync(CONFIG_FILE_PATH_FALLBACK);
 
   // If no config.json exists, we're in SETUP MODE - skip security check
   // The setup wizard will handle initial configuration

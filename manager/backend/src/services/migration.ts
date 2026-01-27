@@ -24,12 +24,12 @@ import bcrypt from 'bcryptjs';
 import { config, reloadConfigFromFile } from '../config.js';
 
 // Paths
-const DATA_DIR = config.dataPath;
+const DATA_DIR = config.hytaleContainerDataPath;
 const CONFIG_JSON_FILE = path.join(DATA_DIR, 'config.json');
 const SETUP_CONFIG_FILE = path.join(DATA_DIR, 'setup-config.json');
 const PANEL_CONFIG_FILE = path.join(DATA_DIR, 'panel-config.json');
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
-const SERVER_CONFIG_FILE = path.join(config.serverPath, 'config.json');
+const SERVER_CONFIG_FILE = path.join(config.hytaleContainerServerPath, 'config.json');
 
 // Environment variable mapping
 interface EnvConfig {
@@ -112,7 +112,7 @@ export async function isExistingInstallation(): Promise<boolean> {
 
   // Check if server files exist
   try {
-    await access(path.join(config.serverPath, 'HytaleServer.jar'), constants.R_OK);
+    await access(path.join(config.hytaleContainerServerPath, 'HytaleServer.jar'), constants.R_OK);
     indicators.hasServerFiles = true;
   } catch {
     // File doesn't exist

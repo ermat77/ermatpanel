@@ -10,6 +10,7 @@ import { spawn } from 'child_process';
 import crypto from 'crypto';
 import { config } from '../config.js';
 import { isPathSafe, safePathJoin } from '../utils/pathSecurity.js';
+import { readServerDir, getServerFileStats, readServerFile } from '../utils/fileAccess.js';
 
 // Asset metadata file to track extraction state
 const ASSET_META_FILE = '.asset-meta.json';
@@ -81,7 +82,7 @@ export function findAssetsArchive(): string | null {
   const possibleNames = ['Assets.zip', 'assets.zip', 'ASSETS.ZIP'];
 
   for (const name of possibleNames) {
-    const archivePath = path.join(config.serverPath, name);
+    const archivePath = path.join(config.hytaleContainerServerPath, name);
     if (fs.existsSync(archivePath)) {
       return archivePath;
     }
@@ -89,7 +90,7 @@ export function findAssetsArchive(): string | null {
 
   // Also check in data directory
   for (const name of possibleNames) {
-    const archivePath = path.join(config.dataPath, name);
+    const archivePath = path.join(config.hytaleContainerDataPath, name);
     if (fs.existsSync(archivePath)) {
       return archivePath;
     }
@@ -128,7 +129,7 @@ async function calculateFileHashAsync(filePath: string): Promise<string> {
  * Read asset metadata
  */
 function readAssetMeta(): AssetMeta | null {
-  const metaPath = path.join(config.assetsPath, ASSET_META_FILE);
+  const metaPath = path.join(config.hytaleContainerAssetsPath, ASSET_META_FILE);
   if (!fs.existsSync(metaPath)) {
     return null;
   }
@@ -145,26 +146,33 @@ function readAssetMeta(): AssetMeta | null {
  * Write asset metadata
  */
 function writeAssetMeta(meta: AssetMeta): void {
-  const metaPath = path.join(config.assetsPath, ASSET_META_FILE);
+  const metaPath = path.join(config.hytaleContainerAssetsPath, ASSET_META_FILE);
   fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
 }
 
 /**
  * Count files in a directory recursively
  */
-function countFiles(dirPath: string): number {
+async function countFiles(dirPath: string): Promise<number> {
   let count = 0;
 
   try {
-    const items = fs.readdirSync(dirPath);
+    const items = await readServerDir(dirPath, 'assets');
     for (const item of items) {
       if (item.startsWith('.')) continue;
-      const itemPath = path.join(dirPath, item);
-      const stat = fs.statSync(itemPath);
-      if (stat.isFile()) {
+      const itemPath = path.posix.join(dirPath, item);
+      const stats = await getServerFileStats(itemPath, 'assets');
+      if (stats) {
+        // If stats exists, it's a file
         count++;
-      } else if (stat.isDirectory()) {
-        count += countFiles(itemPath);
+      } else {
+        // Try to read as directory to check if it's a directory
+        try {
+          await readServerDir(itemPath, 'assets');
+          count += await countFiles(itemPath);
+        } catch {
+          // Not a directory or can't be read
+        }
       }
     }
   } catch {
@@ -177,19 +185,26 @@ function countFiles(dirPath: string): number {
 /**
  * Get total size of a directory
  */
-function getDirectorySize(dirPath: string): number {
+async function getDirectorySize(dirPath: string): Promise<number> {
   let size = 0;
 
   try {
-    const items = fs.readdirSync(dirPath);
+    const items = await readServerDir(dirPath, 'assets');
     for (const item of items) {
       if (item.startsWith('.')) continue;
-      const itemPath = path.join(dirPath, item);
-      const stat = fs.statSync(itemPath);
-      if (stat.isFile()) {
-        size += stat.size;
-      } else if (stat.isDirectory()) {
-        size += getDirectorySize(itemPath);
+      const itemPath = path.posix.join(dirPath, item);
+      const stats = await getServerFileStats(itemPath, 'assets');
+      if (stats) {
+        // If stats exists, it's a file
+        size += stats.size;
+      } else {
+        // Try to read as directory to check if it's a directory
+        try {
+          await readServerDir(itemPath, 'assets');
+          size += await getDirectorySize(itemPath);
+        } catch {
+          // Not a directory or can't be read
+        }
       }
     }
   } catch {
@@ -202,7 +217,7 @@ function getDirectorySize(dirPath: string): number {
 /**
  * Get status of the asset extraction
  */
-export function getAssetStatus(): AssetStatus {
+export async function getAssetStatus(): Promise<AssetStatus> {
   const sourceFile = findAssetsArchive();
   let meta = readAssetMeta();
 
@@ -210,16 +225,16 @@ export function getAssetStatus(): AssetStatus {
   let sourceSize = 0;
 
   // Check if assets directory exists and has content (manually copied)
-  const assetsExist = fs.existsSync(config.assetsPath);
+  const assetsExist = fs.existsSync(config.hytaleContainerAssetsPath);
   let fileCount = meta?.fileCount || 0;
   let totalSize = 0;
 
   if (assetsExist) {
-    totalSize = getDirectorySize(config.assetsPath);
+    totalSize = await getDirectorySize(config.hytaleContainerAssetsPath);
 
     // If no meta but assets exist with files, create meta for manually copied assets
     if (!meta && totalSize > 0) {
-      fileCount = countFiles(config.assetsPath);
+      fileCount = await countFiles(config.hytaleContainerAssetsPath);
       if (fileCount > 0) {
         // Create metadata for manually copied assets
         const newMeta: AssetMeta = {
@@ -311,8 +326,8 @@ export function extractAssets(): { success: boolean; error?: string; message?: s
 async function runExtraction(sourceFile: string): Promise<void> {
   try {
     // Create assets directory if it doesn't exist
-    if (!fs.existsSync(config.assetsPath)) {
-      fs.mkdirSync(config.assetsPath, { recursive: true });
+    if (!fs.existsSync(config.hytaleContainerAssetsPath)) {
+      fs.mkdirSync(config.hytaleContainerAssetsPath, { recursive: true });
     }
 
     // Clear existing assets (except meta file)
@@ -320,11 +335,18 @@ async function runExtraction(sourceFile: string): Promise<void> {
       extractionProgress.currentFile = 'Clearing old files...';
     }
 
-    const existingItems = fs.readdirSync(config.assetsPath);
+    const existingItems = await readServerDir(config.hytaleContainerAssetsPath, 'assets');
     for (const item of existingItems) {
       if (item === ASSET_META_FILE) continue;
-      const itemPath = path.join(config.assetsPath, item);
-      fs.rmSync(itemPath, { recursive: true, force: true });
+      const itemPath = path.posix.join(config.hytaleContainerAssetsPath, item);
+      // Note: fs.rmSync is still used for local cleanup, but we read from container
+      // The actual deletion would need to be done via Docker API if needed
+      // For now, keeping fs.rmSync as it's for local temp cleanup during extraction
+      try {
+        fs.rmSync(itemPath, { recursive: true, force: true });
+      } catch {
+        // Ignore errors
+      }
     }
 
     // Extract using unzip command with verbose output to track progress
@@ -334,7 +356,7 @@ async function runExtraction(sourceFile: string): Promise<void> {
 
     await new Promise<void>((resolve, reject) => {
       // Use unzip with verbose mode to track files
-      const unzip = spawn('unzip', ['-o', sourceFile, '-d', config.assetsPath], {
+      const unzip = spawn('unzip', ['-o', sourceFile, '-d', config.hytaleContainerAssetsPath], {
         stdio: ['ignore', 'pipe', 'pipe'],
       });
 
@@ -387,7 +409,7 @@ async function runExtraction(sourceFile: string): Promise<void> {
       extractionProgress.currentFile = 'Finalizing...';
     }
 
-    const fileCount = countFiles(config.assetsPath);
+    const fileCount = await countFiles(config.hytaleContainerAssetsPath);
 
     // Calculate hash and save metadata
     const sourceHash = calculateFileHashSync(sourceFile);
@@ -422,8 +444,8 @@ async function runExtraction(sourceFile: string): Promise<void> {
  */
 export function clearAssets(): { success: boolean; error?: string } {
   try {
-    if (fs.existsSync(config.assetsPath)) {
-      fs.rmSync(config.assetsPath, { recursive: true, force: true });
+    if (fs.existsSync(config.hytaleContainerAssetsPath)) {
+      fs.rmSync(config.hytaleContainerAssetsPath, { recursive: true, force: true });
     }
     return { success: true };
   } catch (error) {
@@ -437,47 +459,64 @@ export function clearAssets(): { success: boolean; error?: string } {
 /**
  * List files in a directory within the assets
  */
-export function listAssetDirectory(relativePath: string = ''): AssetFileInfo[] | null {
-  const targetPath = safePathJoin(config.assetsPath, relativePath);
+export async function listAssetDirectory(relativePath: string = ''): Promise<AssetFileInfo[] | null> {
+  const targetPath = safePathJoin(config.hytaleContainerAssetsPath, relativePath);
 
-  if (!targetPath || !isPathSafe(targetPath, [config.assetsPath])) {
+  if (!targetPath || !isPathSafe(targetPath, [config.hytaleContainerAssetsPath])) {
     return null;
   }
 
-  if (!fs.existsSync(targetPath)) {
+  // Check if directory exists by trying to read it
+  let isDirectory = false;
+  try {
+    await readServerDir(targetPath, 'assets');
+    isDirectory = true;
+  } catch {
     return null;
   }
 
-  const stat = fs.statSync(targetPath);
-  if (!stat.isDirectory()) {
+  if (!isDirectory) {
     return null;
   }
 
   const items: AssetFileInfo[] = [];
-  const entries = fs.readdirSync(targetPath);
+  try {
+    const entries = await readServerDir(targetPath, 'assets');
 
-  for (const entry of entries) {
-    if (entry.startsWith('.')) continue;
+    for (const entry of entries) {
+      if (entry.startsWith('.')) continue;
 
-    const entryPath = path.join(targetPath, entry);
-    const entryRelPath = relativePath ? `${relativePath}/${entry}` : entry;
+      const entryPath = path.posix.join(targetPath, entry);
+      const entryRelPath = relativePath ? `${relativePath}/${entry}` : entry;
 
-    try {
-      const entryStat = fs.statSync(entryPath);
-      const isDir = entryStat.isDirectory();
+      try {
+        const stats = await getServerFileStats(entryPath, 'assets');
+        let isDir = false;
+        if (!stats) {
+          // Try to read as directory
+          try {
+            await readServerDir(entryPath, 'assets');
+            isDir = true;
+          } catch {
+            // Not a directory or can't be read
+          }
+        }
 
-      items.push({
-        name: entry,
-        path: entryRelPath,
-        type: isDir ? 'directory' : 'file',
-        size: isDir ? 0 : entryStat.size,
-        lastModified: entryStat.mtime.toISOString(),
-        extension: isDir ? undefined : path.extname(entry).toLowerCase(),
-      });
-    } catch {
-      // Skip entries we can't read
-      continue;
+        items.push({
+          name: entry,
+          path: entryRelPath,
+          type: isDir ? 'directory' : 'file',
+          size: isDir ? 0 : (stats?.size || 0),
+          lastModified: stats?.modified.toISOString() || new Date().toISOString(),
+          extension: isDir ? undefined : path.extname(entry).toLowerCase(),
+        });
+      } catch {
+        // Skip entries we can't read
+        continue;
+      }
     }
+  } catch {
+    return null;
   }
 
   // Sort: directories first, then files, alphabetically
@@ -494,27 +533,31 @@ export function listAssetDirectory(relativePath: string = ''): AssetFileInfo[] |
 /**
  * Get asset directory tree (recursive, with depth limit)
  */
-export function getAssetTree(relativePath: string = '', maxDepth: number = 3): AssetTreeNode | null {
-  const targetPath = safePathJoin(config.assetsPath, relativePath);
+export async function getAssetTree(relativePath: string = '', maxDepth: number = 3): Promise<AssetTreeNode | null> {
+  const targetPath = safePathJoin(config.hytaleContainerAssetsPath, relativePath);
 
-  if (!targetPath || !isPathSafe(targetPath, [config.assetsPath])) {
+  if (!targetPath || !isPathSafe(targetPath, [config.hytaleContainerAssetsPath])) {
     return null;
   }
 
-  if (!fs.existsSync(targetPath)) {
+  // Check if directory exists by trying to read it
+  try {
+    await readServerDir(targetPath, 'assets');
+  } catch {
     return null;
   }
 
-  function buildTree(dirPath: string, relPath: string, depth: number): AssetTreeNode {
-    const stat = fs.statSync(dirPath);
+  async function buildTree(dirPath: string, relPath: string, depth: number): Promise<AssetTreeNode> {
     const name = path.basename(dirPath) || 'Assets';
 
-    if (stat.isFile()) {
+    // Check if it's a file by trying to get stats
+    const stats = await getServerFileStats(dirPath, 'assets');
+    if (stats) {
       return {
         name,
         path: relPath,
         type: 'file',
-        size: stat.size,
+        size: stats.size,
         extension: path.extname(name).toLowerCase(),
       };
     }
@@ -529,14 +572,14 @@ export function getAssetTree(relativePath: string = '', maxDepth: number = 3): A
 
     if (depth < maxDepth) {
       try {
-        const entries = fs.readdirSync(dirPath);
+        const entries = await readServerDir(dirPath, 'assets');
         for (const entry of entries) {
           if (entry.startsWith('.')) continue;
 
-          const entryPath = path.join(dirPath, entry);
+          const entryPath = path.posix.join(dirPath, entry);
           const entryRelPath = relPath ? `${relPath}/${entry}` : entry;
 
-          node.children!.push(buildTree(entryPath, entryRelPath, depth + 1));
+          node.children!.push(await buildTree(entryPath, entryRelPath, depth + 1));
         }
 
         // Sort children
@@ -554,7 +597,7 @@ export function getAssetTree(relativePath: string = '', maxDepth: number = 3): A
     return node;
   }
 
-  return buildTree(targetPath, relativePath, 0);
+  return await buildTree(targetPath, relativePath, 0);
 }
 
 /**
@@ -568,9 +611,9 @@ export function readAssetFile(relativePath: string): {
   error?: string;
   isBinary?: boolean;
 } {
-  const targetPath = safePathJoin(config.assetsPath, relativePath);
+  const targetPath = safePathJoin(config.hytaleContainerAssetsPath, relativePath);
 
-  if (!targetPath || !isPathSafe(targetPath, [config.assetsPath])) {
+  if (!targetPath || !isPathSafe(targetPath, [config.hytaleContainerAssetsPath])) {
     return { success: false, error: 'Invalid path' };
   }
 
@@ -756,13 +799,13 @@ function parseRegexPattern(pattern: string): RegExp | null {
  * Search for files in assets
  * Supports: plain text search, glob patterns (*.json, sign*.json), regex (/pattern/flags)
  */
-export function searchAssets(query: string, options?: {
+export async function searchAssets(query: string, options?: {
   searchContent?: boolean;
   extensions?: string[];
   maxResults?: number;
   useRegex?: boolean;
   useGlob?: boolean;
-}): SearchResult[] {
+}): Promise<SearchResult[]> {
   const results: SearchResult[] = [];
   const maxResults = options?.maxResults || 100;
   const searchContent = options?.searchContent || false;
@@ -827,25 +870,40 @@ export function searchAssets(query: string, options?: {
     return { matched: false, index: -1 };
   }
 
-  function searchDir(dirPath: string, relativePath: string): void {
+  async function searchDir(dirPath: string, relativePath: string): Promise<void> {
     if (results.length >= maxResults) return;
 
     try {
-      const entries = fs.readdirSync(dirPath);
+      const entries = await readServerDir(dirPath, 'assets');
 
       for (const entry of entries) {
         if (results.length >= maxResults) break;
         if (entry.startsWith('.')) continue;
 
-        const entryPath = path.join(dirPath, entry);
+        const entryPath = path.posix.join(dirPath, entry);
         const entryRelPath = relativePath ? `${relativePath}/${entry}` : entry;
 
         try {
-          const stat = fs.statSync(entryPath);
+          const stats = await getServerFileStats(entryPath, 'assets');
+          let isDir = false;
+          let fileSize = 0;
+          
+          if (stats) {
+            fileSize = stats.size;
+          } else {
+            // Try to read as directory to check if it's a directory
+            try {
+              await readServerDir(entryPath, 'assets');
+              isDir = true;
+            } catch {
+              // Not a directory or can't be read
+            }
+          }
+
           const ext = path.extname(entry).toLowerCase();
 
           // Filter by extension if specified
-          if (extensions && extensions.length > 0 && stat.isFile()) {
+          if (extensions && extensions.length > 0 && !isDir) {
             if (!extensions.includes(ext)) continue;
           }
 
@@ -854,19 +912,19 @@ export function searchAssets(query: string, options?: {
             results.push({
               path: entryRelPath,
               name: entry,
-              type: stat.isDirectory() ? 'directory' : 'file',
-              size: stat.isFile() ? stat.size : 0,
-              extension: stat.isFile() ? ext : undefined,
+              type: isDir ? 'directory' : 'file',
+              size: isDir ? 0 : fileSize,
+              extension: isDir ? undefined : ext,
               matchType: 'filename',
             });
           }
 
           // Search content for text files
-          if (searchContent && stat.isFile() && stat.size < 1024 * 1024) { // Max 1MB for content search
+          if (searchContent && !isDir && fileSize < 1024 * 1024) { // Max 1MB for content search
             const textExtensions = ['.json', '.txt', '.xml', '.yml', '.yaml', '.cfg', '.lua', '.js', '.ui', '.fbs', '.frag', '.vert', '.glsl', '.shader'];
             if (textExtensions.includes(ext)) {
               try {
-                const content = fs.readFileSync(entryPath, 'utf-8');
+                const content = await readServerFile(entryPath, 'assets');
                 const { matched, index: matchIndex } = matchesContentSearch(content);
 
                 if (matched && matchIndex !== -1) {
@@ -883,7 +941,7 @@ export function searchAssets(query: string, options?: {
                       path: entryRelPath,
                       name: entry,
                       type: 'file',
-                      size: stat.size,
+                      size: fileSize,
                       extension: ext,
                       matchType: 'content',
                       contentPreview: preview.replace(/\n/g, ' '),
@@ -897,8 +955,8 @@ export function searchAssets(query: string, options?: {
           }
 
           // Recurse into directories
-          if (stat.isDirectory()) {
-            searchDir(entryPath, entryRelPath);
+          if (isDir) {
+            await searchDir(entryPath, entryRelPath);
           }
         } catch {
           // Skip entries we can't read
@@ -909,8 +967,12 @@ export function searchAssets(query: string, options?: {
     }
   }
 
-  if (fs.existsSync(config.assetsPath)) {
-    searchDir(config.assetsPath, '');
+  // Check if directory exists by trying to read it
+  try {
+    await readServerDir(config.hytaleContainerAssetsPath, 'assets');
+    await searchDir(config.hytaleContainerAssetsPath, '');
+  } catch {
+    // Directory doesn't exist or can't be read
   }
 
   return results;
@@ -932,7 +994,7 @@ const ITEM_CACHE_TTL = 60 * 60 * 1000; // 1 hour
  * Get list of all available items from the extracted assets
  * Items are located in assets/Common/Icons/ItemsGenerated/
  */
-export function getItemList(forceRefresh: boolean = false): ItemInfo[] {
+export async function getItemList(forceRefresh: boolean = false): Promise<ItemInfo[]> {
   // Return cached list if available and not expired
   const now = Date.now();
   if (!forceRefresh && itemListCache && (now - itemListCacheTime) < ITEM_CACHE_TTL) {
@@ -943,8 +1005,8 @@ export function getItemList(forceRefresh: boolean = false): ItemInfo[] {
   const seenIds = new Set<string>();
 
   // Check if assets are extracted
-  if (!fs.existsSync(config.assetsPath)) {
-    console.log('[Items] Assets path does not exist:', config.assetsPath);
+  if (!fs.existsSync(config.hytaleContainerAssetsPath)) {
+    console.log('[Items] Assets path does not exist:', config.hytaleContainerAssetsPath);
     return items;
   }
 
@@ -961,7 +1023,7 @@ export function getItemList(forceRefresh: boolean = false): ItemInfo[] {
 
   // Find the correct path
   for (const iconPath of itemIconPaths) {
-    files = listAssetDirectory(iconPath);
+    files = await listAssetDirectory(iconPath);
     if (files && files.length > 0) {
       foundPath = iconPath;
       console.log('[Items] Found items in:', iconPath, '- Count:', files.length);
@@ -1021,8 +1083,8 @@ export function getItemList(forceRefresh: boolean = false): ItemInfo[] {
 /**
  * Search items by name or ID
  */
-export function searchItems(query: string, limit: number = 20): ItemInfo[] {
-  const items = getItemList();
+export async function searchItems(query: string, limit: number = 20): Promise<ItemInfo[]> {
+  const items = await getItemList();
   const queryLower = query.toLowerCase();
 
   return items

@@ -1,88 +1,154 @@
 /**
  * File Access Utilities
  * 
- * Handles file access for both development and production modes:
- * - Development (.env.dev): Uses Docker API to access container files
- * - Production (.env): Uses direct filesystem access (volume mounts)
+ * Unified file access - always uses Docker API to access files in the Hytale server container.
+ * The Hytale server is ALWAYS in Docker, regardless of whether the backend is local or containerized.
+ * 
+ * Always use container paths (HYTALE_CONTAINER_*_PATH) when accessing files via Docker API.
  */
 
-import { readdir, readFile, writeFile, stat } from 'fs/promises';
-import { isDevelopmentMode } from '../config.js';
+import path from 'path';
+import { config } from '../config.js';
 import * as dockerService from '../services/docker.js';
 
 /**
- * Read directory contents
- * In dev: Uses Docker API
- * In production: Uses direct filesystem access
+ * Sanitize file content read from Docker
+ * Removes BOM, control characters, and other problematic characters that Docker streams may add
  */
-export async function readServerDir(dirPath: string): Promise<string[]> {
-  if (isDevelopmentMode) {
-    // Development: Use Docker API
-    let files = await dockerService.readContainerDir(dirPath);
-    console.log(`[FileAccess] [Dev] Files: ${files} aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`);
-    return files;
-  } else {
-    // Production: Use direct filesystem access (volume mounts)
-    console.log(`[FileAccess] [Prod] Reading directory via filesystem: ${dirPath}`);
-    return await readdir(dirPath);
+function sanitizeFileContent(content: string): string {
+  if (typeof content !== 'string') {
+    return '';
   }
+
+  // If content is empty, return as-is
+  if (content.length === 0) {
+    return content;
+  }
+
+  let cleaned = content;
+
+  // Remove replacement character (U+FFFD) only if it's at the very beginning
+  // This character appears when Docker has encoding issues
+  if (cleaned.charCodeAt(0) === 0xFFFD) {
+    cleaned = cleaned.substring(1);
+  }
+
+  // Remove BOM (Byte Order Mark) - U+FEFF, only at the start
+  if (cleaned.charCodeAt(0) === 0xFEFF) {
+    cleaned = cleaned.substring(1);
+  }
+
+  // Remove other problematic Unicode characters (zero-width characters, invisible formatting)
+  // But be careful - only remove these specific characters, not all non-printable
+  cleaned = cleaned.replace(/[\u200B-\u200D\u00AD]/g, '');
+
+  // Remove control characters (0x00-0x1F) except newline (0x0A), carriage return (0x0D), and tab (0x09)
+  cleaned = cleaned.replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F]/g, '');
+
+  // Only trim if there's actual content - don't remove all whitespace if that's the content
+  // But we should still remove leading/trailing whitespace for JSON/text files
+  if (cleaned.length > 0) {
+    cleaned = cleaned.trim();
+  }
+
+  return cleaned;
 }
 
 /**
- * Read file content
- * In dev: Uses Docker API
- * In production: Uses direct filesystem access
+ * Base path types for container file access
  */
-export async function readServerFile(filePath: string): Promise<string> {
-  if (isDevelopmentMode) {
-    // Development: Use Docker API
-    console.log(`[FileAccess] [Dev] Reading file via Docker API: ${filePath}`);
-    return await dockerService.readContainerFile(filePath);
-  } else {
-    // Production: Use direct filesystem access (volume mounts)
-    console.log(`[FileAccess] [Prod] Reading file via filesystem: ${filePath}`);
-    return await readFile(filePath, 'utf-8');
-  }
+export type ContainerBasePath = 'server' | 'data' | 'backups' | 'mods' | 'assets';
+
+/**
+ * Get the container base path for a given type
+ */
+function getContainerBasePath(basePath: ContainerBasePath): string {
+  const basePathMap: Record<ContainerBasePath, string> = {
+    server: config.hytaleContainerServerPath,
+    data: config.hytaleContainerDataPath,
+    backups: config.hytaleContainerBackupsPath,
+    mods: config.hytaleContainerModsPath,
+    assets: config.hytaleContainerAssetsPath,
+  };
+  return basePathMap[basePath];
 }
 
 /**
- * Write file content
- * In dev: Uses Docker API
- * In production: Uses direct filesystem access
+ * Read directory contents from container
+ * Always uses Docker API with container paths
+ * 
+ * @param filePath - Container path (absolute starting with /) or relative path
+ * @param basePath - Base path type if filePath is relative (default: 'data')
  */
-export async function writeServerFile(filePath: string, content: string): Promise<void> {
-  if (isDevelopmentMode) {
-    // Development: Use Docker API
-    console.log(`[FileAccess] [Dev] Writing file via Docker API: ${filePath}`);
-    return await dockerService.writeContainerFile(filePath, content);
-  } else {
-    // Production: Use direct filesystem access (volume mounts)
-    console.log(`[FileAccess] [Prod] Writing file via filesystem: ${filePath}`);
-    return await writeFile(filePath, content, 'utf-8');
-  }
+export async function readServerDir(
+  filePath: string,
+  basePath: ContainerBasePath = 'data'
+): Promise<string[]> {
+  // If path is absolute (starts with /), use it directly as container path
+  // Otherwise, treat as relative to basePath
+  const containerPath = filePath.startsWith('/')
+    ? filePath
+    : path.posix.join(getContainerBasePath(basePath), filePath);
+  return await dockerService.readContainerDir(containerPath);
 }
 
 /**
- * Get file stats
- * In dev: Uses Docker API
- * In production: Uses direct filesystem access
+ * Read file content from container
+ * Always uses Docker API with container paths
+ * 
+ * @param filePath - Container path (absolute starting with /) or relative path
+ * @param basePath - Base path type if filePath is relative (default: 'data')
  */
-export async function getServerFileStats(filePath: string): Promise<{ size: number; modified: Date } | null> {
-  if (isDevelopmentMode) {
-    // Development: Use Docker API
-    console.log(`[FileAccess] [Dev] Getting file stats via Docker API: ${filePath}`);
-    return await dockerService.getContainerFileStats(filePath);
-  } else {
-    // Production: Use direct filesystem access (volume mounts)
-    try {
-      console.log(`[FileAccess] [Prod] Getting file stats via filesystem: ${filePath}`);
-      const stats = await stat(filePath);
-      return {
-        size: stats.size,
-        modified: stats.mtime,
-      };
-    } catch {
-      return null;
-    }
-  }
+export async function readServerFile(
+  filePath: string,
+  basePath: ContainerBasePath = 'data'
+): Promise<string> {
+  // If path is absolute (starts with /), use it directly as container path
+  // Otherwise, treat as relative to basePath
+  const containerPath = filePath.startsWith('/')
+    ? filePath
+    : path.posix.join(getContainerBasePath(basePath), filePath);
+  const rawContent = await dockerService.readContainerFile(containerPath);
+  const sanitized = sanitizeFileContent(rawContent);
+  return sanitized;
+}
+
+/**
+ * Write file content to container
+ * Always uses Docker API with container paths
+ * 
+ * @param filePath - Container path (absolute starting with /) or relative path
+ * @param content - File content to write
+ * @param basePath - Base path type if filePath is relative (default: 'data')
+ */
+export async function writeServerFile(
+  filePath: string,
+  content: string,
+  basePath: ContainerBasePath = 'data'
+): Promise<void> {
+  // If path is absolute (starts with /), use it directly as container path
+  // Otherwise, treat as relative to basePath
+  const containerPath = filePath.startsWith('/')
+    ? filePath
+    : path.posix.join(getContainerBasePath(basePath), filePath);
+  return await dockerService.writeContainerFile(containerPath, content);
+}
+
+/**
+ * Get file stats from container
+ * Always uses Docker API with container paths
+ * 
+ * @param filePath - Container path (absolute starting with /) or relative path
+ * @param basePath - Base path type if filePath is relative (default: 'data')
+ */
+export async function getServerFileStats(
+  filePath: string,
+  basePath: ContainerBasePath = 'data'
+): Promise<{ size: number; modified: Date } | null> {
+  // If path is absolute (starts with /), use it directly as container path
+  // Otherwise, treat as relative to basePath
+  const containerPath = filePath.startsWith('/')
+    ? filePath
+    : path.posix.join(getContainerBasePath(basePath), filePath);
+  return await dockerService.getContainerFileStats(containerPath);
 }

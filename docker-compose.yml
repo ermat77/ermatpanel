@@ -162,12 +162,17 @@ services:
       - WEBMAP_PORT=${WEBMAP_PORT:-18081}
       - WEBMAP_WS_PORT=${WEBMAP_WS_PORT:-18082}
 
-      # Paths (inside container)
-      - SERVER_PATH=/opt/hytale/server
-      - BACKUPS_PATH=/opt/hytale/backups
-      - DATA_PATH=/opt/hytale/data
-      - ASSETS_PATH=/opt/hytale/assets
+      # Container paths (ALWAYS use these when accessing via Docker API)
+      # These are the paths inside the Hytale server container
+      - HYTALE_CONTAINER_SERVER_PATH=${HYTALE_CONTAINER_SERVER_PATH:-/opt/hytale/server}
+      - HYTALE_CONTAINER_BACKUPS_PATH=${HYTALE_CONTAINER_BACKUPS_PATH:-/opt/hytale/backups}
+      - HYTALE_CONTAINER_DATA_PATH=${HYTALE_CONTAINER_DATA_PATH:-/opt/hytale/data}
+      - HYTALE_CONTAINER_MODS_PATH=${HYTALE_CONTAINER_MODS_PATH:-/opt/hytale/mods}
+      - HYTALE_CONTAINER_PLUGINS_PATH=${HYTALE_CONTAINER_PLUGINS_PATH:-/opt/hytale/plugins}
+      - HYTALE_CONTAINER_ASSETS_PATH=${HYTALE_CONTAINER_ASSETS_PATH:-/opt/hytale/assets}
+      - HYTALE_CONTAINER_MANAGER_PATH=${HYTALE_CONTAINER_MANAGER_PATH:-/opt/hytale/manager}
 
+      - HYTALE_DOWNLOADER_URL=${HYTALE_DOWNLOADER_URL:-https://downloader.hytale.com/hytale-downloader.zip}
       # Settings
       - TZ=${TZ:-Europe/Berlin}
 
@@ -177,21 +182,22 @@ services:
       # StackMart API (optional)
       - STACKMART_API_KEY=${STACKMART_API_KEY:-}
 
-      # Host data path (for error messages)
+      # Host data path (base path for game server directories)
+      # This is used for accessing game server paths, NOT manager data
+      # Manager data is stored in /app/data (manager-data volume)
       - HOST_DATA_PATH=${HOST_DATA_PATH:-/opt/hytale}
 
     ports:
       - "${MANAGER_PORT:-18080}:18080"
 
     volumes:
-      # Docker socket for container management
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Docker socket for container management (read-write required for container operations)
+      - /var/run/docker.sock:/var/run/docker.sock
 
       # Shared volumes with game server (HOST_DATA_PATH -> /opt/hytale im Container)
       # Server configs need write access for the config editor
       - ${HOST_DATA_PATH:-/opt/hytale}/server:/opt/hytale/server
       - ${HOST_DATA_PATH:-/opt/hytale}/backups:/opt/hytale/backups
-      - ${HOST_DATA_PATH:-/opt/hytale}/data:/opt/hytale/data
       - ${HOST_DATA_PATH:-/opt/hytale}/mods:/opt/hytale/mods
       - ${HOST_DATA_PATH:-/opt/hytale}/plugins:/opt/hytale/plugins
       - ${HOST_DATA_PATH:-/opt/hytale}/auth:/opt/hytale/auth:ro
@@ -200,6 +206,10 @@ services:
       - ${HOST_DATA_PATH:-/opt/hytale}/assets:/opt/hytale/assets
 
       # Manager persistent data
+      # Default: Docker volume (persists between container restarts)
+      # To use bind mount in dev, override this in docker-compose.override.yml:
+      #   volumes:
+      #     - ./manager-data:/app/data
       - manager-data:/app/data
 
     networks:

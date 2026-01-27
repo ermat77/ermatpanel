@@ -1,5 +1,5 @@
 import { Router, Request, Response } from 'express';
-import { readFile, writeFile } from 'fs/promises';
+import * as fileAccess from '../utils/fileAccess.js';
 import path from 'path';
 import { authMiddleware } from '../middleware/auth.js';
 import { requirePermission } from '../middleware/permissions.js';
@@ -9,7 +9,6 @@ import * as kyuubiApi from '../services/kyuubiApi.js';
 import * as chatLog from '../services/chatLog.js';
 import { config } from '../config.js';
 import { logActivity } from '../services/activityLog.js';
-import { isDemoMode, getDemoWhitelist } from '../services/demoData.js';
 import type { AuthenticatedRequest } from '../types/index.js';
 import {
   isValidPlayerName,
@@ -44,7 +43,7 @@ interface WhitelistData {
 
 async function readWhitelist(): Promise<WhitelistData> {
   try {
-    const content = await readFile(path.join(config.serverPath, 'whitelist.json'), 'utf-8');
+    const content = await fileAccess.readServerFile('whitelist.json', 'server');
     return JSON.parse(content);
   } catch {
     return { enabled: false, list: [] };
@@ -52,7 +51,7 @@ async function readWhitelist(): Promise<WhitelistData> {
 }
 
 async function writeWhitelist(data: WhitelistData): Promise<void> {
-  await writeFile(path.join(config.serverPath, 'whitelist.json'), JSON.stringify(data, null, 2), 'utf-8');
+  await fileAccess.writeServerFile('whitelist.json', JSON.stringify(data, null, 2), 'server');
 }
 
 // Name mapping for bans (UUID -> player name)
@@ -62,7 +61,7 @@ interface BanNameMapping {
 
 async function readBansMapping(): Promise<BanNameMapping> {
   try {
-    const content = await readFile(path.join(config.serverPath, 'bans-names.json'), 'utf-8');
+    const content = await fileAccess.readServerFile('bans-names.json', 'server');
     return JSON.parse(content);
   } catch {
     return {};
@@ -70,7 +69,7 @@ async function readBansMapping(): Promise<BanNameMapping> {
 }
 
 async function writeBansMapping(mapping: BanNameMapping): Promise<void> {
-  await writeFile(path.join(config.serverPath, 'bans-names.json'), JSON.stringify(mapping, null, 2), 'utf-8');
+  await fileAccess.writeServerFile('bans-names.json', JSON.stringify(mapping, null, 2), 'server');
 }
 
 // GET /api/players
@@ -141,16 +140,6 @@ router.post('/:name/kick', authMiddleware, requirePermission('players.kick'), as
   // SECURITY: Validate player name
   if (!validatePlayerName(res, playerName)) return;
 
-  // Demo mode: simulate kick
-  if (isDemoMode()) {
-    await logActivity(username, 'kick', 'player', true, playerName, reason);
-    res.json({
-      success: true,
-      message: `[Demo] Player ${playerName} kicked`,
-    });
-    return;
-  }
-
   // SECURITY: Sanitize reason if provided
   const safeReason = reason ? sanitizeMessage(reason, 100) : '';
 
@@ -186,16 +175,6 @@ router.post('/:name/ban', authMiddleware, requirePermission('players.ban'), asyn
 
   // SECURITY: Validate player name
   if (!validatePlayerName(res, playerName)) return;
-
-  // Demo mode: simulate ban
-  if (isDemoMode()) {
-    await logActivity(username, 'ban', 'player', true, playerName, reason);
-    res.json({
-      success: true,
-      message: `[Demo] Player ${playerName} banned`,
-    });
-    return;
-  }
 
   // SECURITY: Sanitize reason if provided
   const safeReason = reason ? sanitizeMessage(reason, 100) : 'You have been banned';
@@ -254,16 +233,6 @@ router.delete('/:name/ban', authMiddleware, requirePermission('players.unban'), 
   // SECURITY: Validate player name
   if (!validatePlayerName(res, playerName)) return;
 
-  // Demo mode: simulate unban
-  if (isDemoMode()) {
-    await logActivity(username, 'unban', 'player', true, playerName);
-    res.json({
-      success: true,
-      message: `[Demo] Player ${playerName} unbanned`,
-    });
-    return;
-  }
-
   // Execute unban command - server will update bans.json
   const result = await dockerService.execCommand(`/unban ${playerName}`);
 
@@ -292,16 +261,6 @@ router.post('/:name/whitelist', authMiddleware, requirePermission('players.white
 
   // SECURITY: Validate player name
   if (!validatePlayerName(res, playerName)) return;
-
-  // Demo mode: simulate whitelist add
-  if (isDemoMode()) {
-    await logActivity(username, 'whitelist_add', 'player', true, playerName);
-    res.json({
-      success: true,
-      message: `[Demo] Player ${playerName} added to whitelist`,
-    });
-    return;
-  }
 
   const result = await dockerService.execCommand(`/whitelist add ${playerName}`);
 
@@ -342,16 +301,6 @@ router.delete('/:name/whitelist', authMiddleware, requirePermission('players.whi
   // SECURITY: Validate player name
   if (!validatePlayerName(res, playerName)) return;
 
-  // Demo mode: simulate whitelist remove
-  if (isDemoMode()) {
-    await logActivity(username, 'whitelist_remove', 'player', true, playerName);
-    res.json({
-      success: true,
-      message: `[Demo] Player ${playerName} removed from whitelist`,
-    });
-    return;
-  }
-
   const result = await dockerService.execCommand(`/whitelist remove ${playerName}`);
 
   if (result.success) {
@@ -389,16 +338,6 @@ router.post('/:name/op', authMiddleware, requirePermission('players.op'), async 
   // SECURITY: Validate player name
   if (!validatePlayerName(res, playerName)) return;
 
-  // Demo mode: simulate op
-  if (isDemoMode()) {
-    await logActivity(username, 'op_add', 'player', true, playerName);
-    res.json({
-      success: true,
-      message: `[Demo] Player ${playerName} is now an operator`,
-    });
-    return;
-  }
-
   const result = await dockerService.execCommand(`/op add ${playerName}`);
 
   if (result.success) {
@@ -423,16 +362,6 @@ router.delete('/:name/op', authMiddleware, requirePermission('players.op'), asyn
 
   // SECURITY: Validate player name
   if (!validatePlayerName(res, playerName)) return;
-
-  // Demo mode: simulate deop
-  if (isDemoMode()) {
-    await logActivity(username, 'op_remove', 'player', true, playerName);
-    res.json({
-      success: true,
-      message: `[Demo] Player ${playerName} is no longer an operator`,
-    });
-    return;
-  }
 
   const result = await dockerService.execCommand(`/op remove ${playerName}`);
 
@@ -463,15 +392,6 @@ router.post('/:name/message', authMiddleware, requirePermission('players.message
     res.status(400).json({
       success: false,
       error: 'Message is required',
-    });
-    return;
-  }
-
-  // Demo mode: simulate message
-  if (isDemoMode()) {
-    res.json({
-      success: true,
-      message: `[Demo] Message sent to ${playerName}`,
     });
     return;
   }
@@ -530,16 +450,6 @@ router.post('/:name/teleport', authMiddleware, requirePermission('players.telepo
     return;
   }
 
-  // Demo mode: simulate teleport
-  if (isDemoMode()) {
-    await logActivity(username, 'teleport', 'player', true, playerName, teleportDetails);
-    res.json({
-      success: true,
-      message: target ? `[Demo] Teleported ${playerName} to ${target}` : `[Demo] Teleported ${playerName} to ${x}, ${y}, ${z}`,
-    });
-    return;
-  }
-
   // Try plugin API first (more reliable)
   try {
     const pluginResult = await kyuubiApi.teleportPlayerViaPlugin(playerName, teleportOptions);
@@ -585,16 +495,6 @@ router.post('/:name/kill', authMiddleware, requirePermission('players.kill'), as
   // SECURITY: Validate player name
   if (!validatePlayerName(res, playerName)) return;
 
-  // Demo mode: simulate kill
-  if (isDemoMode()) {
-    await logActivity(username, 'kill', 'player', true, playerName);
-    res.json({
-      success: true,
-      message: `[Demo] Player ${playerName} killed`,
-    });
-    return;
-  }
-
   // Try plugin API first (more reliable)
   try {
     const pluginResult = await kyuubiApi.killPlayerViaPlugin(playerName);
@@ -634,15 +534,6 @@ router.post('/:name/respawn', authMiddleware, requirePermission('players.respawn
 
   // SECURITY: Validate player name
   if (!validatePlayerName(res, playerName)) return;
-
-  // Demo mode: simulate respawn
-  if (isDemoMode()) {
-    res.json({
-      success: true,
-      message: `[Demo] Player ${playerName} respawned`,
-    });
-    return;
-  }
 
   // Try plugin API first (more reliable)
   try {
@@ -696,16 +587,6 @@ router.post('/:name/gamemode', authMiddleware, requirePermission('players.gamemo
     res.status(400).json({
       success: false,
       error: 'Invalid gamemode. Use: creative, adventure (or c, a)',
-    });
-    return;
-  }
-
-  // Demo mode: simulate gamemode change
-  if (isDemoMode()) {
-    await logActivity(username, 'gamemode', 'player', true, playerName, `Changed to ${gamemode}`);
-    res.json({
-      success: true,
-      message: `[Demo] Set ${playerName}'s gamemode to ${gamemode}`,
     });
     return;
   }
@@ -781,16 +662,6 @@ router.post('/:name/give', authMiddleware, requirePermission('players.give'), as
     return;
   }
 
-  // Demo mode: simulate give
-  if (isDemoMode()) {
-    await logActivity(username, 'give', 'player', true, playerName, `Gave ${amount || 1}x ${item}`);
-    res.json({
-      success: true,
-      message: `[Demo] Gave ${amount || 1} ${item} to ${playerName}`,
-    });
-    return;
-  }
-
   // Command format: /give <player> <item> --quantity=<amount>
   const command = amount && amount > 1
     ? `/give ${playerName} ${item} --quantity=${amount}`
@@ -820,15 +691,6 @@ router.post('/:name/heal', authMiddleware, requirePermission('players.heal'), as
 
   // SECURITY: Validate player name
   if (!validatePlayerName(res, playerName)) return;
-
-  // Demo mode: simulate heal
-  if (isDemoMode()) {
-    res.json({
-      success: true,
-      message: `[Demo] Player ${playerName} healed`,
-    });
-    return;
-  }
 
   // Try plugin API first
   try {
@@ -886,17 +748,6 @@ router.post('/:name/effect', authMiddleware, requirePermission('players.effects'
     return;
   }
 
-  // Demo mode: simulate effect
-  if (isDemoMode()) {
-    const effectDetails = action === 'clear' ? 'Cleared all effects' : `Applied ${effect}`;
-    await logActivity(username, 'effect', 'player', true, playerName, effectDetails);
-    res.json({
-      success: true,
-      message: action === 'clear' ? `[Demo] Cleared effects from ${playerName}` : `[Demo] Applied ${effect} to ${playerName}`,
-    });
-    return;
-  }
-
   // Use --player flag for console commands
   const command = action === 'clear'
     ? `/player effect clear --player ${playerName}`
@@ -926,16 +777,6 @@ router.post('/:name/inventory/clear', authMiddleware, requirePermission('players
 
   // SECURITY: Validate player name
   if (!validatePlayerName(res, playerName)) return;
-
-  // Demo mode: simulate inventory clear
-  if (isDemoMode()) {
-    await logActivity(username, 'inventory_clear', 'player', true, playerName);
-    res.json({
-      success: true,
-      message: `[Demo] Cleared ${playerName}'s inventory`,
-    });
-    return;
-  }
 
   // Try plugin API first
   try {
@@ -1079,16 +920,6 @@ router.post('/:name/teleport/death', authMiddleware, requirePermission('players.
   // Get the requested position (default: last/most recent)
   const posIndex = index !== undefined ? Math.min(Math.max(0, index), positions.length - 1) : positions.length - 1;
   const position = positions[posIndex];
-
-  // Demo mode: simulate teleport to death
-  if (isDemoMode()) {
-    res.json({
-      success: true,
-      message: `[Demo] Teleported ${playerName} to death location (Day ${position.day}: ${position.position.x}, ${position.position.y}, ${position.position.z})`,
-      position,
-    });
-    return;
-  }
 
   // Teleport to death position
   const command = `/tp ${playerName} ${position.position.x} ${position.position.y} ${position.position.z}`;

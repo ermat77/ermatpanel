@@ -195,7 +195,7 @@ export const worldsApi = {
   },
 }
 
-// ============== MODS & PLUGINS ==============
+// ============== MODS ==============
 
 export interface ModInfo {
   name: string
@@ -242,37 +242,6 @@ export const modsApi = {
 
   async getConfigs(filename: string): Promise<{ configs: ConfigFile[] }> {
     const response = await api.get<{ configs: ConfigFile[] }>(`/management/mods/${encodeURIComponent(filename)}/configs`)
-    return response.data
-  },
-}
-
-export const pluginsApi = {
-  async get(): Promise<{ plugins: ModInfo[]; path: string }> {
-    const response = await api.get<{ plugins: ModInfo[]; path: string }>('/management/plugins')
-    return response.data
-  },
-
-  async toggle(filename: string): Promise<{ success: boolean }> {
-    const response = await api.put<{ success: boolean }>(`/management/plugins/${encodeURIComponent(filename)}/toggle`)
-    return response.data
-  },
-
-  async upload(file: File): Promise<{ success: boolean; filename: string; size: number }> {
-    const formData = new FormData()
-    formData.append('file', file)
-    const response = await api.post<{ success: boolean; filename: string; size: number }>('/management/plugins/upload', formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-    })
-    return response.data
-  },
-
-  async delete(filename: string): Promise<{ success: boolean }> {
-    const response = await api.delete<{ success: boolean }>(`/management/plugins/${encodeURIComponent(filename)}`)
-    return response.data
-  },
-
-  async getConfigs(filename: string): Promise<{ configs: ConfigFile[] }> {
-    const response = await api.get<{ configs: ConfigFile[] }>(`/management/plugins/${encodeURIComponent(filename)}/configs`)
     return response.data
   },
 }

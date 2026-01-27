@@ -5,9 +5,9 @@
  * Also tracks player death positions for teleportation.
  */
 
-import { readFile, writeFile, mkdir, readdir } from 'fs/promises';
+import { readFile, writeFile, mkdir } from 'fs/promises';
 import path from 'path';
-import { isDemoMode, getDemoGlobalChatLog, getDemoPlayerChatLog } from './demoData.js';
+import { readServerDir } from '../utils/fileAccess.js';
 
 // Chat message entry
 export interface ChatMessage {
@@ -109,7 +109,7 @@ async function saveMessagesToFile(filePath: string, messages: ChatMessage[]): Pr
 // Get list of available date files in a directory
 async function getAvailableDates(directory: string): Promise<string[]> {
   try {
-    const files = await readdir(directory);
+    const files = await readServerDir(directory, 'data');
     return files
       .filter(f => f.endsWith('.json'))
       .map(f => f.replace('.json', ''))
@@ -182,11 +182,6 @@ export async function addChatMessage(player: string, message: string, uuid?: str
     message,
   };
 
-  // Demo mode: return simulated entry without saving
-  if (isDemoMode()) {
-    return entry;
-  }
-
   const today = getDateKey();
   await loadTodaysChatLog();
 
@@ -214,11 +209,6 @@ export async function getGlobalChatLog(options?: {
   limit?: number;
   offset?: number;
 }): Promise<{ messages: ChatMessage[]; total: number; availableDays: number }> {
-  // Demo mode: return mock chat data
-  if (isDemoMode()) {
-    return getDemoGlobalChatLog(options);
-  }
-
   await loadTodaysChatLog();
 
   const days = options?.days ?? 7;
@@ -281,11 +271,6 @@ export async function getPlayerChatLog(
     offset?: number;
   }
 ): Promise<{ messages: ChatMessage[]; total: number; availableDays: number }> {
-  // Demo mode: return mock chat data for player
-  if (isDemoMode()) {
-    return getDemoPlayerChatLog(playerName, options);
-  }
-
   const normalized = normalizePlayerName(playerName);
   const playerDir = path.join(PLAYER_CHAT_DIR, normalized);
   const days = options?.days ?? 7;
@@ -349,11 +334,6 @@ export async function recordDeathPosition(
     y: Math.round(y * 100) / 100,
     z: Math.round(z * 100) / 100,
   };
-
-  // Demo mode: return simulated entry without saving
-  if (isDemoMode()) {
-    return entry;
-  }
 
   const positions = await loadPlayerDeathPositions(player);
   positions.push(entry);

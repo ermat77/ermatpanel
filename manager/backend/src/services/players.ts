@@ -5,19 +5,6 @@ import type { PlayerInfo } from '../types/index.js';
 import { recordDeathPosition, getLastDeathPosition } from './chatLog.js';
 import * as fileAccess from '../utils/fileAccess.js';
 import { readFile, writeFile, mkdir } from 'fs/promises';
-import {
-  isDemoMode,
-  getDemoOnlinePlayers,
-  getDemoOfflinePlayers,
-  getDemoAllPlayers,
-  getDemoPlayerCount,
-  getDemoPlayerStatistics,
-  getDemoDailyActivity,
-  getDemoAllPlayersUnified,
-  getDemoPlayerInventory,
-  getDemoPlayerDetails,
-  getDemoDeathPositions,
-} from './demoData.js';
 
 // ============================================================
 // Player Data File Interfaces (from server/universe/players/)
@@ -255,13 +242,13 @@ function isValidPlayerName(name: string): boolean {
 
 // File path for the unified players.json (backend data file, not server file)
 async function getPlayersPath(): Promise<string> {
-  return path.join(config.dataPath, 'players.json');
+  return path.join(config.hytaleContainerDataPath, 'players.json');
 }
 
 // Ensure data directory exists
 async function ensureDataDir(): Promise<void> {
   try {
-    await mkdir(config.dataPath, { recursive: true });
+    await mkdir(config.hytaleContainerDataPath, { recursive: true });
   } catch {
     // Directory may already exist
   }
@@ -535,11 +522,6 @@ export async function scanLogs(): Promise<void> {
 
 // Get online players
 export async function getOnlinePlayers(): Promise<PlayerInfo[]> {
-  // Demo mode: return mock data
-  if (isDemoMode()) {
-    return getDemoOnlinePlayers();
-  }
-
   await loadPlayers();
 
   const now = new Date();
@@ -563,11 +545,6 @@ export async function getOnlinePlayers(): Promise<PlayerInfo[]> {
 
 // Get offline players
 export async function getOfflinePlayers(): Promise<PlayerEntry[]> {
-  // Demo mode: return mock data
-  if (isDemoMode()) {
-    return getDemoOfflinePlayers();
-  }
-
   await loadPlayers();
   return Array.from(players.values())
     .filter(p => !p.online)
@@ -576,11 +553,6 @@ export async function getOfflinePlayers(): Promise<PlayerEntry[]> {
 
 // Get all players
 export async function getAllPlayers(): Promise<PlayerEntry[]> {
-  // Demo mode: return mock data
-  if (isDemoMode()) {
-    return getDemoAllPlayers();
-  }
-
   await loadPlayers();
   return Array.from(players.values())
     .sort((a, b) => new Date(b.lastSeen).getTime() - new Date(a.lastSeen).getTime());
@@ -588,11 +560,6 @@ export async function getAllPlayers(): Promise<PlayerEntry[]> {
 
 // Get player count
 export async function getPlayerCount(): Promise<number> {
-  // Demo mode: return mock data
-  if (isDemoMode()) {
-    return getDemoPlayerCount();
-  }
-
   await loadPlayers();
   return Array.from(players.values()).filter(p => p.online).length;
 }
@@ -697,11 +664,9 @@ function updatePeakOnline(): void {
 }
 
 export async function getPlayerStatistics(): Promise<PlayerStatistics> {
-  // Demo mode: return mock data
-  if (isDemoMode()) {
-    return getDemoPlayerStatistics();
-  }
-
+  // Ensure players are loaded (idempotent - returns immediately if already loaded)
+  // Note: The in-memory players Map is updated in real-time via processLogLine()
+  // when players connect/disconnect, so stats are always accurate without reloading
   await loadPlayers();
   updatePeakOnline();
 
@@ -741,11 +706,6 @@ export interface DailyActivity {
 }
 
 export async function getDailyActivity(days: number = 7): Promise<DailyActivity[]> {
-  // Demo mode: return mock data
-  if (isDemoMode()) {
-    return getDemoDailyActivity(days);
-  }
-
   await loadPlayers();
 
   const result: DailyActivity[] = [];
@@ -877,11 +837,6 @@ async function readPlayerFile(uuid: string): Promise<PlayerFileData | null> {
  * Get player inventory by name
  */
 export async function getPlayerInventoryFromFile(playerName: string): Promise<ParsedPlayerInventory | null> {
-  // Demo mode: return mock data
-  if (isDemoMode()) {
-    return getDemoPlayerInventory(playerName);
-  }
-
   const uuid = await findPlayerUuidByName(playerName);
   if (!uuid) return null;
 
@@ -933,11 +888,6 @@ export async function getPlayerInventoryFromFile(playerName: string): Promise<Pa
  * Get player details by name
  */
 export async function getPlayerDetailsFromFile(playerName: string): Promise<ParsedPlayerDetails | null> {
-  // Demo mode: return mock data
-  if (isDemoMode()) {
-    return getDemoPlayerDetails(playerName);
-  }
-
   const uuid = await findPlayerUuidByName(playerName);
   if (!uuid) return null;
 
@@ -1078,11 +1028,6 @@ export interface ParsedDeathPosition {
  * Returns array sorted by most recent (last in array = most recent)
  */
 export async function getPlayerDeathPositionsFromFile(playerName: string): Promise<ParsedDeathPosition[]> {
-  // Demo mode: return mock data
-  if (isDemoMode()) {
-    return getDemoDeathPositions(playerName);
-  }
-
   const uuid = await findPlayerUuidByName(playerName);
   if (!uuid) return [];
 
@@ -1128,11 +1073,6 @@ export async function getPlayerDeathPositionsFromFile(playerName: string): Promi
  * Also includes online players who don't have JSON files yet (e.g., after folder deletion)
  */
 export async function getAllPlayersUnified(): Promise<UnifiedPlayerEntry[]> {
-  // Demo mode: return mock data
-  if (isDemoMode()) {
-    return getDemoAllPlayersUnified();
-  }
-
   await loadPlayers(); // Load session tracking data
 
   const result: UnifiedPlayerEntry[] = [];

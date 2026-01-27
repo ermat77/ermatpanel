@@ -3,48 +3,134 @@ import { config } from '../config.js';
 import type { ServerStatus, ServerStats, ActionResponse } from '../types/index.js';
 import { validateCommand, escapeShellArg } from '../utils/sanitize.js';
 import { clearOnlinePlayers } from './players.js';
-import { isDemoMode, getDemoStatus, getDemoStats, getDemoLogs } from './demoData.js';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 
 /**
  * Get the Docker socket path based on the operating system
- * - Windows: Uses named pipe //./pipe/docker_engine
- * - Linux/Mac: Uses Unix socket /var/run/docker.sock
+ * - When running in Docker container: Always use /var/run/docker.sock
+ * - Windows (native): Uses named pipe //./pipe/docker_engine
+ * - Linux/Mac (native): Uses Unix socket /var/run/docker.sock
  */
 function getDockerSocketPath(): string {
-  const platform = os.platform();
+  // Check if we're running inside a Docker container
+  const hasDockerenv = fs.existsSync('/.dockerenv');
+  const hasDockerEnv = !!process.env.DOCKER_CONTAINER;
+  const isInDocker = hasDockerenv || hasDockerEnv;
   
+  console.log('[Docker] Initializing Docker connection...');
+  console.log(`[Docker] Environment detection:`);
+  console.log(`  - Platform: ${os.platform()}`);
+  console.log(`  - /.dockerenv exists: ${hasDockerenv}`);
+  console.log(`  - DOCKER_CONTAINER env: ${hasDockerEnv}`);
+  console.log(`  - Running in Docker: ${isInDocker}`);
+  
+  // If in Docker container, always use Unix socket (even on Windows host)
+  if (isInDocker) {
+    const path = '/var/run/docker.sock';
+    console.log(`[Docker] Using Docker socket path (container): ${path}`);
+    return path;
+  }
+  
+  // Native execution: check platform
+  const platform = os.platform();
   if (platform === 'win32') {
     // Windows uses a named pipe
-    return '//./pipe/docker_engine';
+    const path = '//./pipe/docker_engine';
+    console.log(`[Docker] Using Docker socket path (Windows native): ${path}`);
+    return path;
   } else {
     // Linux and macOS use Unix socket
-    return '/var/run/docker.sock';
+    const path = '/var/run/docker.sock';
+    console.log(`[Docker] Using Docker socket path (Linux/Mac native): ${path}`);
+    return path;
   }
 }
 
 const dockerSocketPath = getDockerSocketPath();
-const docker = new Docker({ socketPath: dockerSocketPath });
+console.log(`[Docker] Creating Docker client with socket: ${dockerSocketPath}`);
 
-// // Log Docker configuration on module load
-// console.log(`[Docker] 🐳 Docker service initialized`);
-// console.log(`[Docker]   Platform: ${os.platform()}`);
-// console.log(`[Docker]   Container name: ${config.gameContainerName}`);
-// console.log(`[Docker]   Socket path: ${dockerSocketPath}`);
-// console.log(`[Docker]   Server path: ${config.serverPath}`);
-
-/**
- * Check if we're running in local development (not in Docker)
- */
-function isLocalDevelopment(): boolean {
-  return !process.env.GAME_CONTAINER_NAME && !process.env.STACK_NAME;
+// Verify socket exists and is accessible before creating client
+async function verifyDockerSocket(): Promise<{ accessible: boolean; error?: string }> {
+  try {
+    // Check if socket file exists (skip for Windows named pipes)
+    const isInDocker = fs.existsSync('/.dockerenv') || !!process.env.DOCKER_CONTAINER;
+    const platform = os.platform();
+    
+    if (!isInDocker && platform === 'win32') {
+      // Windows named pipes don't support fs.access, skip check
+      console.log('[Docker] Skipping socket file check for Windows named pipe');
+      return { accessible: true };
+    }
+    
+    // Check if socket file exists
+    if (!fs.existsSync(dockerSocketPath)) {
+      return {
+        accessible: false,
+        error: `Docker socket not found at ${dockerSocketPath}. Ensure Docker is running and socket is mounted.`,
+      };
+    }
+    
+    // Check if socket is accessible (read and write)
+    try {
+      await fs.promises.access(dockerSocketPath, fs.constants.R_OK | fs.constants.W_OK);
+      console.log('[Docker] Socket file is accessible');
+      
+      // Get file stats for logging
+      const stats = await fs.promises.stat(dockerSocketPath);
+      console.log(`[Docker] Socket file stats: mode=${stats.mode.toString(8)}, uid=${stats.uid}, gid=${stats.gid}`);
+    } catch (accessError) {
+      const err = accessError as NodeJS.ErrnoException;
+      return {
+        accessible: false,
+        error: `Cannot access Docker socket at ${dockerSocketPath}: ${err.code || err.message}. Ensure the container has read-write access to the socket.`,
+      };
+    }
+    
+    return { accessible: true };
+  } catch (error) {
+    return {
+      accessible: false,
+      error: `Error checking Docker socket: ${error instanceof Error ? error.message : 'Unknown error'}`,
+    };
+  }
 }
+
+const docker = new Docker({ socketPath: dockerSocketPath });
+console.log('[Docker] Docker client initialized');
+
+// Test connection to Docker daemon (called on first use)
+async function testDockerConnection(): Promise<boolean> {
+  try {
+    await docker.info();
+    console.log('[Docker] ✅ Successfully connected to Docker daemon');
+    return true;
+  } catch (error) {
+    console.error(`[Docker] ❌ Failed to connect to Docker daemon: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    return false;
+  }
+}
+
+// Verify socket on startup (non-blocking)
+verifyDockerSocket().then((socketCheck) => {
+  if (!socketCheck.accessible) {
+    console.error(`[Docker] ⚠️  WARNING: Docker socket not accessible: ${socketCheck.error}`);
+    console.error(`[Docker] ⚠️  Docker operations will fail until socket is accessible`);
+  } else {
+    console.log('[Docker] ✅ Docker socket verified and accessible');
+    // Test connection after socket is verified
+    testDockerConnection().catch(() => {
+      console.warn('[Docker] ⚠️  Docker connection test failed, but continuing startup');
+    });
+  }
+}).catch((err) => {
+  console.warn(`[Docker] ⚠️  Socket verification failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
+});
+
 
 async function getContainer(): Promise<Docker.Container | null> {
   const containerName = config.gameContainerName;
-  console.log(`[Docker] Attempting to get container: ${containerName}`);
   
   try {
     const container = docker.getContainer(containerName);
@@ -70,14 +156,18 @@ async function getContainer(): Promise<Docker.Container | null> {
 }
 
 export async function getStatus(): Promise<ServerStatus> {
-  // Demo mode: return mock status
-  if (isDemoMode()) {
-    return getDemoStatus();
-  }
-
-  console.log(`[Docker] Getting container status for: ${config.gameContainerName}`);
-  
   try {
+    // Verify socket is accessible before attempting operations
+    const socketCheck = await verifyDockerSocket();
+    if (!socketCheck.accessible) {
+      console.error(`[Docker] ❌ Cannot access Docker socket: ${socketCheck.error}`);
+      return {
+        status: 'error',
+        running: false,
+        error: socketCheck.error || 'Cannot access Docker socket',
+      };
+    }
+    
     const container = await getContainer();
     if (!container) {
       console.error(`[Docker] ❌ Container not found: ${config.gameContainerName}`);
@@ -97,14 +187,6 @@ export async function getStatus(): Promise<ServerStatus> {
       created: info.Created,
       started_at: info.State.StartedAt,
     };
-    
-    // console.log(`[Docker] ✅ Container status retrieved:`, {
-    //   status: status.status,
-    //   running: status.running,
-    //   id: status.id,
-    //   name: status.name,
-    // });
-    
     return status;
   } catch (error) {
     console.error(`[Docker] ❌ Error getting container status:`, error instanceof Error ? error.message : 'Unknown error');
@@ -117,11 +199,6 @@ export async function getStatus(): Promise<ServerStatus> {
 }
 
 export async function getStats(): Promise<ServerStats> {
-  // Demo mode: return mock stats
-  if (isDemoMode()) {
-    return getDemoStats();
-  }
-
   try {
     const container = await getContainer();
     if (!container) {
@@ -160,11 +237,6 @@ export async function getStats(): Promise<ServerStats> {
 }
 
 export async function startContainer(): Promise<ActionResponse> {
-  // Demo mode: simulate success
-  if (isDemoMode()) {
-    return { success: true, message: '[DEMO] Container started' };
-  }
-
   try {
     const container = await getContainer();
     if (!container) {
@@ -179,11 +251,6 @@ export async function startContainer(): Promise<ActionResponse> {
 }
 
 export async function stopContainer(): Promise<ActionResponse> {
-  // Demo mode: simulate success
-  if (isDemoMode()) {
-    return { success: true, message: '[DEMO] Container stopped' };
-  }
-
   try {
     const container = await getContainer();
     if (!container) {
@@ -200,10 +267,6 @@ export async function stopContainer(): Promise<ActionResponse> {
 }
 
 export async function restartContainer(): Promise<ActionResponse> {
-  // Demo mode: simulate success
-  if (isDemoMode()) {
-    return { success: true, message: '[DEMO] Container restarted' };
-  }
 
   try {
     const container = await getContainer();
@@ -221,48 +284,7 @@ export async function restartContainer(): Promise<ActionResponse> {
 }
 
 export async function getLogs(tail: number = 100): Promise<string> {
-  // Demo mode: return mock logs
-  if (isDemoMode()) {
-    return getDemoLogs(tail);
-  }
-
-  // Local development: read from log file
-  if (isLocalDevelopment()) {
-    console.log(`[Docker] [Local Dev] Reading logs from local files (tail: ${tail})`);
-    // In local dev, the directory is typically 'hytale-server' not 'server'
-    const baseServerPath = config.serverPath.includes('hytale-server') 
-      ? config.serverPath 
-      : path.resolve(config.serverPath, '..', 'hytale-server');
-    
-    const logPaths = [
-      path.join(baseServerPath, 'logs', 'latest.log'),
-      path.join(baseServerPath, 'logs', 'server.log'),
-      path.join(baseServerPath, 'server.log'),
-      path.join(config.dataPath, 'logs', 'latest.log'),
-      // Fallback to original serverPath if hytale-server doesn't exist
-      path.join(config.serverPath, 'logs', 'latest.log'),
-      path.join(config.serverPath, 'logs', 'server.log'),
-      path.join(config.serverPath, 'server.log'),
-    ];
-
-    for (const logPath of logPaths) {
-      if (fs.existsSync(logPath)) {
-        try {
-          const content = fs.readFileSync(logPath, 'utf-8');
-          const lines = content.split('\n');
-          // Return last N lines
-          const start = tail > 0 && tail < lines.length ? lines.length - tail : 0;
-          return lines.slice(start).join('\n');
-        } catch (error) {
-          console.error(`[Local Dev] Failed to read log file ${logPath}:`, error);
-        }
-      }
-    }
-    return '';
-  }
-
-  // Docker mode: get logs from container
-  console.log(`[Docker] Getting logs from container: ${config.gameContainerName} (tail: ${tail})`);
+  // Always use Docker API - server is always in Docker
   try {
     const container = await getContainer();
     if (!container) {
@@ -270,7 +292,6 @@ export async function getLogs(tail: number = 100): Promise<string> {
       return '';
     }
 
-    console.log(`[Docker] ✅ Container found, fetching logs...`);
     const logs = await container.logs({
       stdout: true,
       stderr: true,
@@ -293,11 +314,9 @@ let stdinAttached = false;
 
 async function ensureStdinAttached(): Promise<boolean> {
   if (stdinAttached && stdinStream) {
-    console.log(`[Docker] ✅ Stdin already attached to container: ${config.gameContainerName}`);
     return true;
   }
 
-  console.log(`[Docker] Attaching stdin to container: ${config.gameContainerName}`);
   
   try {
     const container = await getContainer();
@@ -312,7 +331,6 @@ async function ensureStdinAttached(): Promise<boolean> {
       return false;
     }
 
-    console.log(`[Docker] ✅ Container is running, attaching stdin...`);
     
     // Attach to container stdin
     const stream = await container.attach({
@@ -325,7 +343,6 @@ async function ensureStdinAttached(): Promise<boolean> {
 
     stdinStream = stream;
     stdinAttached = true;
-    console.log(`[Docker] ✅ Stdin attached successfully to container: ${config.gameContainerName}`);
 
     stream.on('error', (error) => {
       console.error(`[Docker] ❌ Stdin stream error:`, error instanceof Error ? error.message : 'Unknown error');
@@ -347,16 +364,6 @@ async function ensureStdinAttached(): Promise<boolean> {
 }
 
 export async function execCommand(command: string): Promise<ActionResponse> {
-  // Demo mode: simulate command execution
-  if (isDemoMode()) {
-    // SECURITY: Still validate command even in demo mode
-    const validation = validateCommand(command);
-    if (!validation.valid) {
-      return { success: false, error: validation.error || 'Invalid command' };
-    }
-    return { success: true, message: `[DEMO] Command executed: ${command}` };
-  }
-
   // SECURITY: Validate command against whitelist and injection patterns
   const validation = validateCommand(command);
   if (!validation.valid) {
@@ -364,40 +371,7 @@ export async function execCommand(command: string): Promise<ActionResponse> {
     return { success: false, error: validation.error || 'Invalid command' };
   }
 
-  // Local development: write command to file or named pipe
-  if (isLocalDevelopment()) {
-    // In local dev, the directory is typically 'hytale-server' not 'server'
-    const baseServerPath = config.serverPath.includes('hytale-server') 
-      ? config.serverPath 
-      : path.resolve(config.serverPath, '..', 'hytale-server');
-    
-    const commandFile = path.join(baseServerPath, '.command_input');
-    const commandPipe = path.join(baseServerPath, 'command_pipe');
-    
-    try {
-      // Try named pipe first (if server is set up to read from it)
-      if (fs.existsSync(commandPipe)) {
-        fs.appendFileSync(commandPipe, command + '\n');
-        return { success: true, message: `Command sent: ${command}` };
-      }
-      
-      // Fallback: write to file (server would need to watch this file)
-      fs.appendFileSync(commandFile, command + '\n');
-      console.log(`[Local Dev] Command written to ${commandFile}. Server needs to read from this file.`);
-      console.warn('[Local Dev] Server must be configured to read commands from .command_input file');
-      return { 
-        success: true, 
-        message: `Command written to file: ${command} (Note: Server must read from .command_input file)`
-      };
-    } catch (error) {
-      return { 
-        success: false, 
-        error: `Failed to send command: ${error instanceof Error ? error.message : 'Unknown error'}` 
-      };
-    }
-  }
-
-  // Docker mode: execute command in container
+  // Always use Docker exec - server is always in Docker
   console.log(`[Docker] Executing command in container: ${config.gameContainerName}`);
   console.log(`[Docker] Command: ${command.substring(0, 100)}${command.length > 100 ? '...' : ''}`);
   
@@ -407,8 +381,6 @@ export async function execCommand(command: string): Promise<ActionResponse> {
       console.error(`[Docker] ❌ Cannot execute command - container not found: ${config.gameContainerName}`);
       return { success: false, error: 'Container not found' };
     }
-    
-    console.log(`[Docker] ✅ Container found, executing command...`);
 
     const info = await container.inspect();
     if (!info.State.Running) {
@@ -471,15 +443,7 @@ export async function execCommand(command: string): Promise<ActionResponse> {
 }
 
 // Execute a shell command inside the container and capture output
-export async function execInContainer(command: string): Promise<ActionResponse & { output?: string }> {
-  // Demo mode: return mock output for known commands
-  if (isDemoMode()) {
-    if (command.includes('stats memory')) {
-      const { getDemoMemoryStats } = await import('./demoData.js');
-      return { success: true, output: getDemoMemoryStats().raw };
-    }
-    return { success: true, output: '[DEMO] Command executed' };
-  }
+export async function execInGameServerContainer(command: string): Promise<ActionResponse & { output?: string }> {
 
   try {
     const container = await getContainer();
@@ -601,6 +565,48 @@ export async function readContainerDir(containerPath: string): Promise<string[]>
 /**
  * Read file content from Docker container
  */
+/**
+ * Demultiplex Docker stream data
+ * Docker uses 8-byte headers for multiplexed streams:
+ * - Byte 0: stream type (0=stdin, 1=stdout, 2=stderr)
+ * - Bytes 1-3: reserved (0)
+ * - Bytes 4-7: size of payload (big-endian uint32)
+ */
+function demuxDockerStream(chunk: Buffer): string {
+  let result = '';
+  let offset = 0;
+
+  while (offset < chunk.length) {
+    // Check if we have enough bytes for header
+    if (offset + 8 > chunk.length) {
+      // Not enough data for header, treat as raw data (shouldn't happen, but safe fallback)
+      break;
+    }
+
+    // Read header
+    const streamType = chunk.readUInt8(offset);
+    const size = chunk.readUInt32BE(offset + 4);
+
+    // Validate header - stream type should be 0, 1, or 2
+    if (streamType > 2 || size > chunk.length - offset - 8) {
+      // Invalid header, treat remaining as raw string data
+      const rawData = chunk.slice(offset).toString('utf-8');
+      result += rawData;
+      break;
+    }
+
+    // Only extract stdout (streamType === 1) payload
+    if (streamType === 1) {
+      const payload = chunk.slice(offset + 8, offset + 8 + size).toString('utf-8');
+      result += payload;
+    }
+
+    offset += 8 + size;
+  }
+
+  return result;
+}
+
 export async function readContainerFile(containerPath: string): Promise<string> {
   try {
     const container = await getContainer();
@@ -625,15 +631,29 @@ export async function readContainerFile(containerPath: string): Promise<string> 
 
     return new Promise((resolve, reject) => {
       stream.on('data', (chunk: Buffer) => {
-        const data = chunk.toString('utf8');
-        output += data;
+        // Properly demux Docker stream to extract actual data
+        try {
+          const demuxed = demuxDockerStream(chunk);
+          output += demuxed;
+        } catch {
+          // Fallback: if demuxing fails, try direct conversion (may have issues)
+          const data = chunk.toString('utf8');
+          output += data;
+        }
       });
 
       stream.on('end', () => {
-        // Clean up docker stream headers and control characters
-        // Docker streams can contain control characters like \x1D (Group Separator) in stream framing
-        // Remove all control characters (0x00-0x1F) except newline (0x0A), carriage return (0x0D), and tab (0x09)
-        const cleanOutput = output.replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F]/g, '');
+        // Remove control characters (0x00-0x1F) except newline (0x0A), carriage return (0x0D), and tab (0x09)
+        let cleanOutput = output.replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F]/g, '');
+        
+        // Remove BOM (Byte Order Mark) - U+FEFF, only at the start
+        if (cleanOutput.length > 0 && cleanOutput.charCodeAt(0) === 0xFEFF) {
+          cleanOutput = cleanOutput.substring(1);
+        }
+        
+        // Remove other problematic Unicode characters (zero-width characters, invisible formatting)
+        cleanOutput = cleanOutput.replace(/[\u200B-\u200D\u00AD]/g, '');
+        
         resolve(cleanOutput);
       });
 
@@ -642,15 +662,21 @@ export async function readContainerFile(containerPath: string): Promise<string> 
       });
 
       setTimeout(() => {
-        // Clean up docker stream headers and control characters
-        // Docker streams can contain control characters like \x1D (Group Separator) in stream framing
-        // Remove all control characters (0x00-0x1F) except newline (0x0A), carriage return (0x0D), and tab (0x09)
-        const cleanOutput = output.replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F]/g, '');
+        // Remove control characters (0x00-0x1F) except newline (0x0A), carriage return (0x0D), and tab (0x09)
+        let cleanOutput = output.replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F]/g, '');
+        
+        // Remove BOM (Byte Order Mark) - U+FEFF, only at the start
+        if (cleanOutput.length > 0 && cleanOutput.charCodeAt(0) === 0xFEFF) {
+          cleanOutput = cleanOutput.substring(1);
+        }
+        
+        // Remove other problematic Unicode characters (zero-width characters, invisible formatting)
+        cleanOutput = cleanOutput.replace(/[\u200B-\u200D\u00AD]/g, '');
+        
         resolve(cleanOutput);
       }, 5000);
     });
   } catch (error) {
-    console.error(`[Docker] ❌ Failed to read file ${containerPath}:`, error instanceof Error ? error.message : 'Unknown error');
     throw error;
   }
 }
@@ -780,11 +806,17 @@ export async function copyFileToContainer(localFilePath: string, containerPath: 
 
     // Write file using base64 decode
     const tempFile = `/tmp/upload_${Date.now()}_${Math.random().toString(36).substring(7)}.b64`;
+    const uniqueDelimiter = `EOF_${Date.now()}_${Math.random().toString(36).substring(7)}`;
     console.log(`[Docker] 📝 Writing base64 to temp file: ${tempFile}`);
     
-    // Write base64 content to temp file in container using heredoc
+    // Write base64 content to temp file in container using heredoc with unique delimiter
+    // Use a unique delimiter to avoid conflicts with base64 content
+    // Construct the heredoc command with actual newlines (not \n escape sequences)
+    const heredocCommand = `cat > "${tempFile}" << '${uniqueDelimiter}'
+${base64Content}
+${uniqueDelimiter}`;
     const writeExec = await container.exec({
-      Cmd: ['sh', '-c', `cat > "${tempFile}" << 'EOFBASE64'\n${base64Content}\nEOFBASE64`],
+      Cmd: ['sh', '-c', heredocCommand],
       AttachStdout: true,
       AttachStderr: true,
     });

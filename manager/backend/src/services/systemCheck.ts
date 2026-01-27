@@ -47,44 +47,98 @@ async function checkDockerSocket(): Promise<SystemCheck> {
     required: true,
   };
 
-  // Get Docker socket path based on OS
+  console.log('[SystemCheck] Starting Docker socket check...');
+
+  // Get Docker socket path - check if we're in Docker container first
+  const hasDockerenv = fs.existsSync('/.dockerenv');
+  const hasDockerEnv = !!process.env.DOCKER_CONTAINER;
+  const isInDocker = hasDockerenv || hasDockerEnv;
   const platform = os.platform();
-  const socketPath = platform === 'win32' 
-    ? '//./pipe/docker_engine' 
-    : '/var/run/docker.sock';
+  
+  console.log('[SystemCheck] Environment detection:');
+  console.log(`  - Platform: ${platform}`);
+  console.log(`  - /.dockerenv exists: ${hasDockerenv}`);
+  console.log(`  - DOCKER_CONTAINER env: ${hasDockerEnv}`);
+  console.log(`  - Running in Docker: ${isInDocker}`);
+  
+  // If in Docker container, always use Unix socket (even on Windows host)
+  // Otherwise, use platform-specific path
+  const socketPath = isInDocker
+    ? '/var/run/docker.sock'
+    : (platform === 'win32' ? '//./pipe/docker_engine' : '/var/run/docker.sock');
+
+  console.log(`[SystemCheck] Selected socket path: ${socketPath}`);
 
   try {
-    // On Windows, named pipes don't support access() check, so skip it
-    if (platform !== 'win32') {
-      // First check if socket file exists (Linux/Mac only)
-      await fs.promises.access(socketPath, fs.constants.R_OK | fs.constants.W_OK);
+    // On Windows native or when in Docker, check socket accessibility
+    // Named pipes on Windows don't support access() check, so skip it for native Windows
+    if (!isInDocker && platform === 'win32') {
+      console.log('[SystemCheck] Skipping file access check for Windows named pipe');
+    } else {
+      // First check if socket file exists (Linux/Mac/Docker)
+      console.log(`[SystemCheck] Checking socket file accessibility: ${socketPath}`);
+      try {
+        await fs.promises.access(socketPath, fs.constants.R_OK | fs.constants.W_OK);
+        console.log('[SystemCheck] Socket file is accessible');
+        
+        // Get file stats for additional info
+        const stats = await fs.promises.stat(socketPath);
+        console.log(`[SystemCheck] Socket file stats: mode=${stats.mode.toString(8)}, uid=${stats.uid}, gid=${stats.gid}`);
+      } catch (accessError) {
+        const accessErr = accessError as NodeJS.ErrnoException;
+        console.error(`[SystemCheck] Socket file access check failed: ${accessErr.code} - ${accessErr.message}`);
+        throw accessError;
+      }
     }
 
     // Try to connect using dockerode
+    console.log(`[SystemCheck] Attempting to connect to Docker using socket: ${socketPath}`);
     const docker = new Docker({ socketPath });
+    
+    console.log('[SystemCheck] Calling docker.info()...');
     const info = await docker.info();
+    console.log('[SystemCheck] Successfully connected to Docker');
+    console.log(`  - Server Version: ${info.ServerVersion}`);
+    console.log(`  - Containers: ${info.Containers}`);
+    console.log(`  - Images: ${info.Images}`);
+    console.log(`  - Operating System: ${info.OperatingSystem}`);
 
     check.status = 'ok';
     check.message = 'Connected';
     check.details = `Docker version: ${info.ServerVersion}, Containers: ${info.Containers}`;
   } catch (error) {
     const err = error as NodeJS.ErrnoException;
+    
+    console.error('[SystemCheck] Docker socket check failed:');
+    console.error(`  - Error code: ${err.code || 'N/A'}`);
+    console.error(`  - Error message: ${err.message || 'N/A'}`);
+    console.error(`  - Error name: ${err.name || 'N/A'}`);
+    if (err.stack) {
+      console.error(`  - Stack trace: ${err.stack}`);
+    }
 
     if (err.code === 'ENOENT') {
       check.status = 'error';
       check.message = 'Docker socket not found';
       check.details = `Docker must be installed and running. Socket path: ${socketPath}`;
+      console.error(`[SystemCheck] Socket file does not exist at: ${socketPath}`);
     } else if (err.code === 'EACCES') {
       check.status = 'error';
       check.message = 'Permission denied';
       check.details = `Cannot access Docker socket. Ensure the container has access to ${socketPath}`;
+      console.error(`[SystemCheck] Permission denied accessing socket. Current process:`);
+      console.error(`  - UID: ${process.getuid ? process.getuid() : 'N/A (Windows)'}`);
+      console.error(`  - GID: ${process.getgid ? process.getgid() : 'N/A (Windows)'}`);
+      console.error(`[SystemCheck] Try: chmod 666 ${socketPath} or add user to docker group`);
     } else {
       check.status = 'error';
       check.message = 'Connection failed';
       check.details = err.message || 'Unknown error connecting to Docker';
+      console.error(`[SystemCheck] Unexpected error: ${err.code || 'N/A'} - ${err.message}`);
     }
   }
 
+  console.log(`[SystemCheck] Docker socket check completed: ${check.status} - ${check.message}`);
   return check;
 }
 
@@ -253,53 +307,82 @@ async function checkDiskSpace(): Promise<SystemCheck> {
     required: true,
   };
 
-  const dataPath = config.dataPath || '/opt/hytale/data';
-  const hostDataPath = config.hostDataPath || '/opt/hytale';
+  // Determine the correct data path based on environment:
+  // - In Docker (production): Use container path (mounted volume)
+  // - In dev (not in Docker): Use host path (absolute path on host machine)
+  const isInDocker = fs.existsSync('/.dockerenv') || !!process.env.DOCKER_CONTAINER;
+  const dataPath = isInDocker 
+    ? config.hytaleContainerDataPath  // Docker: /opt/hytale/data (mounted from host)
+    : path.join(config.hostDataPath, 'data');  // Dev: hostDataPath/data (absolute host path)
+  const hostDataPath = config.hostDataPath;
   const minSpaceGB = 10;
   const minSpaceBytes = minSpaceGB * 1024 * 1024 * 1024;
 
   try {
-    // Use df command to get disk space info
-    const { stdout } = await execAsync(`df -B1 "${dataPath}" 2>/dev/null || df -B1 / 2>/dev/null`);
-    const lines = stdout.trim().split('\n');
+    let availableBytes: number;
 
-    if (lines.length >= 2) {
-      const parts = lines[1].split(/\s+/);
-      // df output: Filesystem, 1B-blocks, Used, Available, Use%, Mounted on
-      // Sometimes output can wrap, so find the numeric values
-      let availableBytes = NaN;
+    // Check if running on Windows (in dev mode)
+    const isWindows = process.platform === 'win32';
 
-      // Try to find the "Available" column (usually index 3)
-      for (let i = 1; i < parts.length; i++) {
-        const val = parseInt(parts[i], 10);
-        if (!isNaN(val) && i >= 3) {
-          availableBytes = val;
-          break;
-        }
-      }
-
-      // Fallback: try parts[3] directly
-      if (isNaN(availableBytes) && parts[3]) {
-        availableBytes = parseInt(parts[3], 10);
-      }
-
+    if (isWindows && !isInDocker) {
+      // Windows: Use PowerShell to get disk space
+      // Get the drive letter from the path (e.g., C from C:/Users/... or C:\Users\...)
+      const driveMatch = dataPath.match(/^([A-Za-z]):/);
+      const driveLetter = driveMatch ? driveMatch[1] : 'C';
+      
+      // Use PowerShell to get free space for the drive
+      // Get-PSDrive returns free space in bytes
+      const psCommand = `powershell -Command "(Get-PSDrive -Name '${driveLetter}').Free"`;
+      const { stdout } = await execAsync(psCommand);
+      const freeSpaceStr = stdout.trim();
+      availableBytes = parseInt(freeSpaceStr, 10);
+      
       if (isNaN(availableBytes)) {
-        throw new Error('Could not parse available space from df output');
-      }
-
-      const availableGB = availableBytes / (1024 * 1024 * 1024);
-
-      if (availableBytes >= minSpaceBytes) {
-        check.status = 'ok';
-        check.message = `${availableGB.toFixed(1)} GB available`;
-        check.details = `Path: ${hostDataPath}`;
-      } else {
-        check.status = 'error';
-        check.message = `Only ${availableGB.toFixed(1)} GB available`;
-        check.details = `Minimum: ${minSpaceGB} GB at ${hostDataPath}`;
+        throw new Error(`Could not parse available space from PowerShell output: "${freeSpaceStr}"`);
       }
     } else {
-      throw new Error('Could not parse df output');
+      // Linux/Unix: Use df command to get disk space info
+      const { stdout } = await execAsync(`df -B1 "${dataPath}" 2>/dev/null || df -B1 / 2>/dev/null`);
+      const lines = stdout.trim().split('\n');
+
+      if (lines.length >= 2) {
+        const parts = lines[1].split(/\s+/);
+        // df output: Filesystem, 1B-blocks, Used, Available, Use%, Mounted on
+        // Sometimes output can wrap, so find the numeric values
+        availableBytes = NaN;
+
+        // Try to find the "Available" column (usually index 3)
+        for (let i = 1; i < parts.length; i++) {
+          const val = parseInt(parts[i], 10);
+          if (!isNaN(val) && i >= 3) {
+            availableBytes = val;
+            break;
+          }
+        }
+
+        // Fallback: try parts[3] directly
+        if (isNaN(availableBytes) && parts[3]) {
+          availableBytes = parseInt(parts[3], 10);
+        }
+
+        if (isNaN(availableBytes)) {
+          throw new Error('Could not parse available space from df output');
+        }
+      } else {
+        throw new Error('Could not parse df output');
+      }
+    }
+
+    const availableGB = availableBytes / (1024 * 1024 * 1024);
+
+    if (availableBytes >= minSpaceBytes) {
+      check.status = 'ok';
+      check.message = `${availableGB.toFixed(1)} GB available`;
+      check.details = `Path: ${hostDataPath}`;
+    } else {
+      check.status = 'error';
+      check.message = `Only ${availableGB.toFixed(1)} GB available`;
+      check.details = `Minimum: ${minSpaceGB} GB at ${hostDataPath}`;
     }
   } catch (error) {
     const err = error as Error;
@@ -359,6 +442,7 @@ async function checkRam(): Promise<SystemCheck> {
 
 /**
  * Check write permissions in data directory
+ * Checks both game server data path (where manager writes configs) and manager's own data path
  */
 async function checkWritePermissions(): Promise<SystemCheck> {
   const check: SystemCheck = {
@@ -369,8 +453,14 @@ async function checkWritePermissions(): Promise<SystemCheck> {
     required: true,
   };
 
-  const dataPath = config.dataPath || '/opt/hytale/data';
-  const hostDataPath = config.hostDataPath || '/opt/hytale';
+  // Determine the correct data path based on environment:
+  // - In Docker (production): Use container path (mounted volume)
+  // - In dev (not in Docker): Use host path (absolute path on host machine)
+  const isInDocker = fs.existsSync('/.dockerenv') || !!process.env.DOCKER_CONTAINER;
+  const dataPath = isInDocker 
+    ? config.hytaleContainerDataPath  // Docker: /opt/hytale/data (mounted from host)
+    : path.join(config.hostDataPath, 'data');  // Dev: hostDataPath/data (absolute host path)
+  const hostDataPath = config.hostDataPath;
   const testFileName = `.write-test-${Date.now()}-${Math.random().toString(36).substring(7)}`;
   const testFilePath = path.join(dataPath, testFileName);
 

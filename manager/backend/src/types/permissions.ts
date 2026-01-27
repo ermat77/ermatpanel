@@ -68,13 +68,6 @@ export const PERMISSIONS = {
   'mods.config': 'Edit mod configuration',
   'mods.toggle': 'Enable/disable mods',
 
-  // Plugins
-  'plugins.view': 'View plugins',
-  'plugins.install': 'Install plugins',
-  'plugins.delete': 'Delete plugins',
-  'plugins.config': 'Edit plugin configuration',
-  'plugins.toggle': 'Enable/disable plugins',
-
   // Config
   'config.view': 'View configuration',
   'config.edit': 'Edit configuration',
@@ -162,7 +155,6 @@ export const PERMISSION_CATEGORIES = [
   'scheduler',
   'worlds',
   'mods',
-  'plugins',
   'config',
   'assets',
   'users',
@@ -235,10 +227,6 @@ export const DEFAULT_ROLES: Omit<Role, 'id' | 'createdAt' | 'updatedAt'>[] = [
       'mods.install',
       'mods.config',
       'mods.toggle',
-      'plugins.view',
-      'plugins.install',
-      'plugins.config',
-      'plugins.toggle',
       'config.view',
       'config.edit',
       'activity.view',
@@ -261,7 +249,6 @@ export const DEFAULT_ROLES: Omit<Role, 'id' | 'createdAt' | 'updatedAt'>[] = [
       'scheduler.view',
       'worlds.view',
       'mods.view',
-      'plugins.view',
       'config.view',
       'assets.view',
       'activity.view',

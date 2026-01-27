@@ -5,7 +5,6 @@ import { useAuthStore } from '@/stores/auth'
 import Card from '@/components/ui/Card.vue'
 import {
   modsApi,
-  pluginsApi,
   configApi,
   modStoreApi,
   modtaleApi,
@@ -58,11 +57,10 @@ function getLocalizedText(text: string | LocalizedString | undefined | null): st
   return String(text)
 }
 
-type TabType = 'mods' | 'plugins' | 'store' | 'modtale' | 'stackmart'
+type TabType = 'mods' | 'store' | 'modtale' | 'stackmart'
 
 const activeTab = ref<TabType>('mods')
 const mods = ref<ModInfo[]>([])
-const plugins = ref<ModInfo[]>([])
 const modsPath = ref('')
 const loading = ref(true)
 const error = ref('')
@@ -130,33 +128,17 @@ async function loadData() {
   loading.value = true
   error.value = ''
 
-  // Load mods and plugins separately to handle permission errors gracefully
-  const results = await Promise.allSettled([
-    authStore.hasPermission('mods.view') ? modsApi.get() : Promise.reject('no-permission'),
-    authStore.hasPermission('plugins.view') ? pluginsApi.get() : Promise.reject('no-permission'),
-  ])
-
-  // Handle mods result
-  if (results[0].status === 'fulfilled') {
-    mods.value = results[0].value.mods
-    modsPath.value = results[0].value.path
-  }
-
-  // Handle plugins result
-  if (results[1].status === 'fulfilled') {
-    plugins.value = results[1].value.plugins
-    modsPath.value = results[1].value.path
-  }
-
-  // Only show error if both failed (and not due to missing permissions)
-  const modsFailedWithError = results[0].status === 'rejected' && results[0].reason !== 'no-permission'
-  const pluginsFailedWithError = results[1].status === 'rejected' && results[1].reason !== 'no-permission'
-
-  if (modsFailedWithError && pluginsFailedWithError) {
+  try {
+    if (authStore.hasPermission('mods.view')) {
+      const result = await modsApi.get()
+      mods.value = result.mods
+      modsPath.value = result.path
+    }
+  } catch (e) {
     error.value = t('errors.connectionFailed')
+  } finally {
+    loading.value = false
   }
-
-  loading.value = false
 }
 
 async function loadStoreData() {
@@ -290,15 +272,6 @@ async function toggleMod(mod: ModInfo) {
   }
 }
 
-async function togglePlugin(plugin: ModInfo) {
-  try {
-    await pluginsApi.toggle(plugin.filename)
-    await loadData()
-  } catch (e) {
-    error.value = t('errors.serverError')
-  }
-}
-
 function triggerUpload() {
   fileInput.value?.click()
 }
@@ -312,11 +285,7 @@ async function handleFileUpload(event: Event) {
   error.value = ''
 
   try {
-    if (activeTab.value === 'mods') {
-      await modsApi.upload(file)
-    } else {
-      await pluginsApi.upload(file)
-    }
+    await modsApi.upload(file)
     await loadData()
   } catch (e: any) {
     error.value = e.response?.data?.error || t('errors.serverError')
@@ -330,11 +299,7 @@ async function deleteItem(item: ModInfo) {
   if (!confirm(t('mods.confirmDelete', { name: item.name }))) return
 
   try {
-    if (activeTab.value === 'mods') {
-      await modsApi.delete(item.filename)
-    } else {
-      await pluginsApi.delete(item.filename)
-    }
+    await modsApi.delete(item.filename)
     await loadData()
   } catch (e) {
     error.value = t('errors.serverError')
@@ -350,8 +315,7 @@ async function openConfigEditor(item: ModInfo) {
   showConfigModal.value = true
 
   try {
-    const api = activeTab.value === 'mods' ? modsApi : pluginsApi
-    const result = await api.getConfigs(item.filename)
+    const result = await modsApi.getConfigs(item.filename)
     configFiles.value = result.configs
   } catch (e) {
     error.value = t('errors.serverError')
@@ -403,7 +367,7 @@ function formatDate(dateStr: string): string {
   return new Date(dateStr).toLocaleDateString()
 }
 
-const currentItems = computed(() => activeTab.value === 'mods' ? mods.value : plugins.value)
+const currentItems = computed(() => mods.value)
 const currentPath = computed(() => activeTab.value === 'mods' ? modsPath.value : modsPath.value)
 const enabledCount = computed(() => currentItems.value.filter(i => i.enabled).length)
 
@@ -544,7 +508,6 @@ async function openModtaleDetail(project: ModtaleProject) {
 
 function getClassificationColor(classification: string): string {
   const colors: Record<string, string> = {
-    PLUGIN: 'bg-purple-500/20 text-purple-400',
     DATA: 'bg-blue-500/20 text-blue-400',
     ART: 'bg-pink-500/20 text-pink-400',
     SAVE: 'bg-green-500/20 text-green-400',
@@ -699,7 +662,6 @@ async function openStackMartDetail(resource: StackMartResource) {
 
 function getStackMartCategoryColor(category: string): string {
   const colors: Record<string, string> = {
-    plugins: 'bg-purple-500/20 text-purple-400',
     mods: 'bg-blue-500/20 text-blue-400',
     scripts: 'bg-green-500/20 text-green-400',
     tools: 'bg-orange-500/20 text-orange-400',
@@ -739,7 +701,7 @@ onMounted(loadData)
       </div>
       <div class="flex items-center gap-3">
         <button
-          v-if="authStore.hasAnyPermission('mods.install', 'plugins.install')"
+          v-if="authStore.hasPermission('mods.install')"
           @click="triggerUpload"
           :disabled="uploading"
           class="px-4 py-2 bg-hytale-orange text-dark font-medium rounded-lg hover:bg-hytale-yellow transition-colors flex items-center gap-2 disabled:opacity-50"
@@ -786,20 +748,6 @@ onMounted(loadData)
         {{ t('mods.mods') }} ({{ mods.length }})
       </button>
       <button
-        @click="activeTab = 'plugins'"
-        :class="[
-          'px-4 py-2 rounded-lg font-medium transition-colors flex items-center gap-2',
-          activeTab === 'plugins'
-            ? 'bg-purple-500 text-white'
-            : 'bg-dark-100 text-gray-400 hover:text-white'
-        ]"
-      >
-        <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 14v6m-3-3h6M6 10h2a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v2a2 2 0 002 2zm10 0h2a2 2 0 002-2V6a2 2 0 00-2-2h-2a2 2 0 00-2 2v2a2 2 0 002 2zM6 20h2a2 2 0 002-2v-2a2 2 0 00-2-2H6a2 2 0 00-2 2v2a2 2 0 002 2z" />
-        </svg>
-        {{ t('mods.plugins') }} ({{ plugins.length }})
-      </button>
-      <button
         @click="switchToStore"
         :class="[
           'px-4 py-2 rounded-lg font-medium transition-colors flex items-center gap-2',
@@ -843,8 +791,8 @@ onMounted(loadData)
       </button>
     </div>
 
-    <!-- Info Card (Mods/Plugins tabs) -->
-    <Card v-if="activeTab === 'mods' || activeTab === 'plugins'">
+    <!-- Info Card (Mods tab) -->
+    <Card v-if="activeTab === 'mods'">
       <div class="flex items-start gap-4">
         <div class="p-3 bg-hytale-orange/20 rounded-lg">
           <svg class="w-6 h-6 text-hytale-orange" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -875,8 +823,8 @@ onMounted(loadData)
       </div>
     </Card>
 
-    <!-- Items List (Mods/Plugins) -->
-    <Card v-if="activeTab === 'mods' || activeTab === 'plugins'" :title="activeTab === 'mods' ? t('mods.mods') : t('mods.plugins')" :padding="false">
+    <!-- Items List (Mods) -->
+    <Card v-if="activeTab === 'mods'" :title="t('mods.mods')" :padding="false">
       <div v-if="loading" class="text-center text-gray-500 p-8">
         {{ t('common.loading') }}
       </div>
@@ -885,7 +833,7 @@ onMounted(loadData)
         <svg class="w-12 h-12 mx-auto mb-3 opacity-50" fill="none" viewBox="0 0 24 24" stroke="currentColor">
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4" />
         </svg>
-        {{ activeTab === 'mods' ? t('mods.noMods') : t('mods.noPlugins') }}
+        {{ t('mods.noMods') }}
       </div>
 
       <div v-else class="divide-y divide-dark-50/30">
@@ -899,20 +847,17 @@ onMounted(loadData)
             <div
               :class="[
                 'w-12 h-12 rounded-lg flex items-center justify-center',
-                item.enabled
-                  ? (activeTab === 'mods' ? 'bg-hytale-orange/20' : 'bg-purple-500/20')
-                  : 'bg-gray-600/20'
+                item.enabled ? 'bg-hytale-orange/20' : 'bg-gray-600/20'
               ]"
             >
               <svg
                 class="w-6 h-6"
-                :class="item.enabled ? (activeTab === 'mods' ? 'text-hytale-orange' : 'text-purple-400') : 'text-gray-500'"
+                :class="item.enabled ? 'text-hytale-orange' : 'text-gray-500'"
                 fill="none"
                 viewBox="0 0 24 24"
                 stroke="currentColor"
               >
-                <path v-if="activeTab === 'mods'" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
-                <path v-else stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 14v6m-3-3h6M6 10h2a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v2a2 2 0 002 2zm10 0h2a2 2 0 002-2V6a2 2 0 00-2-2h-2a2 2 0 00-2 2v2a2 2 0 002 2zM6 20h2a2 2 0 002-2v-2a2 2 0 00-2-2H6a2 2 0 00-2 2v2a2 2 0 002 2z" />
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
               </svg>
             </div>
 
@@ -962,7 +907,7 @@ onMounted(loadData)
             </button>
             <!-- Config Button -->
             <button
-              v-if="authStore.hasPermission(activeTab === 'mods' ? 'mods.config' : 'plugins.config')"
+              v-if="authStore.hasPermission('mods.config')"
               @click="openConfigEditor(item)"
               class="p-2 text-gray-400 hover:text-blue-400 transition-colors"
               :title="t('mods.editConfig')"
@@ -975,7 +920,7 @@ onMounted(loadData)
 
             <!-- Delete Button -->
             <button
-              v-if="authStore.hasPermission(activeTab === 'mods' ? 'mods.delete' : 'plugins.delete')"
+              v-if="authStore.hasPermission('mods.delete')"
               @click="deleteItem(item)"
               class="p-2 text-gray-400 hover:text-status-error transition-colors"
               :title="t('common.delete')"
@@ -987,11 +932,11 @@ onMounted(loadData)
 
             <!-- Toggle Button -->
             <button
-              v-if="authStore.hasPermission(activeTab === 'mods' ? 'mods.toggle' : 'plugins.toggle')"
-              @click="activeTab === 'mods' ? toggleMod(item) : togglePlugin(item)"
+              v-if="authStore.hasPermission('mods.toggle')"
+              @click="toggleMod(item)"
               :class="[
                 'relative inline-flex h-6 w-11 items-center rounded-full transition-colors',
-                item.enabled ? (activeTab === 'mods' ? 'bg-hytale-orange' : 'bg-purple-500') : 'bg-dark-50'
+                item.enabled ? 'bg-hytale-orange' : 'bg-dark-50'
               ]"
             >
               <span
@@ -1224,7 +1169,6 @@ onMounted(loadData)
             class="px-4 py-2 bg-dark-100 border border-dark-50 rounded-lg text-white focus:outline-none focus:border-cyan-500"
           >
             <option value="">{{ t('mods.allTypes') }}</option>
-            <option value="PLUGIN">Plugins</option>
             <option value="DATA">Data Packs</option>
             <option value="ART">Art/Resources</option>
             <option value="SAVE">Saves</option>
@@ -1645,7 +1589,6 @@ onMounted(loadData)
             class="px-4 py-2 bg-dark-100 border border-dark-50 rounded-lg text-white focus:outline-none focus:border-amber-500"
           >
             <option value="">{{ t('mods.allCategories') }}</option>
-            <option value="plugins">Plugins</option>
             <option value="mods">Mods</option>
             <option value="scripts">Scripts</option>
             <option value="tools">Tools</option>

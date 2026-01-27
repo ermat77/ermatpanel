@@ -9,10 +9,26 @@ import {
   PermissionEntry,
 } from '../types/permissions.js';
 import { getUser, getAllUsers, invalidateUserTokens } from './users.js';
-import { isDemoMode } from './demoData.js';
 
 // Path to roles file in the persistent data volume
-const DATA_DIR = process.env.DATA_PATH || '/app/data';
+// Manager-specific files path:
+//   - If HOST_DATA_PATH env var is set: use it (override)
+//   - If running locally: use HOST_DATA_PATH/manager
+//   - If running in Docker: default to /app/data
+function getManagerDataPath(): string {
+  if (process.env.HOST_DATA_PATH) {
+    return process.env.HOST_DATA_PATH;
+  }
+  const fs = require('fs');
+  const isInDocker = fs.existsSync('/.dockerenv') || !!process.env.DOCKER_CONTAINER;
+  if (!isInDocker) {
+    const hostDataPath = process.env.HOST_DATA_PATH || '/opt/hytale';
+    return path.join(hostDataPath, 'manager');
+  }
+  return '/app/data';
+}
+
+const DATA_DIR = getManagerDataPath();
 const ROLES_FILE = path.join(DATA_DIR, 'roles.json');
 
 // Ensure data directory exists
@@ -110,12 +126,6 @@ async function migrateSystemRoleDescriptions(data: RolesData): Promise<boolean> 
 
 // Initialize roles on startup - creates file with DEFAULT_ROLES if it doesn't exist
 export async function initializeRoles(): Promise<void> {
-  // Demo mode: skip file initialization
-  if (isDemoMode()) {
-    console.log('[Roles] Demo mode - using in-memory demo roles');
-    return;
-  }
-
   await ensureDataDir();
 
   if (!(await rolesFileExists())) {
@@ -133,67 +143,14 @@ export async function initializeRoles(): Promise<void> {
   }
 }
 
-// Demo roles for demo mode
-function getDemoRoles(): Role[] {
-  const now = new Date().toISOString();
-  return [
-    {
-      id: 'admin',
-      name: 'Administrator',
-      description: 'Full access to all features',
-      permissions: ['*'],
-      isSystem: true,
-      createdAt: now,
-      updatedAt: now,
-    },
-    {
-      id: 'moderator',
-      name: 'Moderator',
-      description: 'Player management and chat moderation',
-      permissions: ['players.view', 'players.kick', 'players.ban', 'players.unban', 'console.view', 'chat.view', 'server.view_status'],
-      isSystem: true,
-      createdAt: now,
-      updatedAt: now,
-    },
-    {
-      id: 'operator',
-      name: 'Operator',
-      description: 'Server management and technical tasks',
-      permissions: ['server.view_status', 'server.start', 'server.stop', 'server.restart', 'console.view', 'console.execute', 'backups.view', 'scheduler.view'],
-      isSystem: true,
-      createdAt: now,
-      updatedAt: now,
-    },
-    {
-      id: 'viewer',
-      name: 'Viewer',
-      description: 'Read-only access to basic information',
-      permissions: ['server.view_status', 'players.view', 'console.view'],
-      isSystem: true,
-      createdAt: now,
-      updatedAt: now,
-    },
-  ];
-}
-
 // Get all roles
 export async function getAllRoles(): Promise<Role[]> {
-  // Demo mode: return in-memory demo roles
-  if (isDemoMode()) {
-    return getDemoRoles();
-  }
-
   const data = await readRoles();
   return data.roles;
 }
 
 // Get role by ID
 export async function getRole(id: string): Promise<Role | null> {
-  // Demo mode: return from in-memory demo roles
-  if (isDemoMode()) {
-    return getDemoRoles().find((r) => r.id === id) || null;
-  }
-
   const data = await readRoles();
   return data.roles.find((r) => r.id === id) || null;
 }
@@ -336,38 +293,6 @@ export async function deleteRole(id: string): Promise<void> {
 
 // Get all permissions for a user by looking up their role
 export async function getUserPermissions(username: string): Promise<PermissionEntry[]> {
-  // Demo mode: return hardcoded permissions without file I/O
-  if (isDemoMode()) {
-    const user = await getUser(username);
-    if (!user) {
-      return [];
-    }
-
-    // Admin gets all permissions
-    if (user.roleId === 'admin') {
-      return ['*'];
-    }
-
-    // Viewer (demo user) gets read-only permissions
-    if (user.roleId === 'viewer') {
-      return [
-        'server.view_status',
-        'players.view',
-        'console.view',
-        'performance.view',
-        'backups.view',
-        'scheduler.view',
-        'mods.view',
-        'plugins.view',
-        'worlds.view',
-        'chat.view',
-        'activity.view',
-      ];
-    }
-
-    return [];
-  }
-
   const user = await getUser(username);
 
   if (!user) {

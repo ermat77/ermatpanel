@@ -129,7 +129,7 @@ interface InstalledModsData {
 const INSTALLED_MODS_FILE = 'modtale-installed.json';
 
 function getInstalledModsPath(): string {
-  return path.join(config.dataPath, INSTALLED_MODS_FILE);
+  return path.join(config.hytaleContainerDataPath, INSTALLED_MODS_FILE);
 }
 
 async function loadInstalledMods(): Promise<InstalledModsData> {
@@ -600,18 +600,18 @@ export async function installModFromModtale(
   // Note: Hytale server loads all mods from /mods directory, so PLUGIN also goes there
   switch (project.classification) {
     case 'PLUGIN':
-      targetPath = config.modsPath; // Plugins also go to mods folder - Hytale loads from /mods
+      targetPath = config.hytaleContainerModsPath; // Plugins also go to mods folder - Hytale loads from /mods
       break;
     case 'DATA':
     case 'ART':
     case 'SAVE':
-      targetPath = config.dataPath;
+      targetPath = config.hytaleContainerDataPath;
       break;
     case 'MODPACK':
-      targetPath = config.modsPath;
+      targetPath = config.hytaleContainerModsPath;
       break;
     default:
-      targetPath = config.modsPath;
+      targetPath = config.hytaleContainerModsPath;
   }
 
   // Ensure target directory exists
@@ -730,16 +730,16 @@ export async function uninstallModtale(projectId: string): Promise<{ success: bo
   let basePath: string;
   switch (installed.classification) {
     case 'PLUGIN':
-      basePath = config.modsPath; // Plugins also in mods folder - Hytale loads from /mods
+      basePath = config.hytaleContainerModsPath; // Plugins also in mods folder - Hytale loads from /mods
       break;
     case 'DATA':
     case 'ART':
     case 'SAVE':
-      basePath = config.dataPath;
+      basePath = config.hytaleContainerDataPath;
       break;
     case 'MODPACK':
     default:
-      basePath = config.modsPath;
+      basePath = config.hytaleContainerModsPath;
   }
 
   const filePath = path.join(basePath, installed.filename);

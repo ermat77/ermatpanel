@@ -5,6 +5,8 @@ import { config } from '../config.js';
 import type { BackupInfo, StorageInfo, ActionResponse } from '../types/index.js';
 import { isValidBackupName } from '../utils/sanitize.js';
 import { isPathSafe } from '../utils/pathSecurity.js';
+import { readServerDir, getServerFileStats } from '../utils/fileAccess.js';
+import * as dockerService from './docker.js';
 
 // SECURITY: Validate backup ID to prevent path traversal
 function validateBackupId(backupId: string): boolean {
@@ -14,14 +16,16 @@ function validateBackupId(backupId: string): boolean {
   return safePattern.test(backupId) && !backupId.includes('..');
 }
 
-export function listBackups(): BackupInfo[] {
+export async function listBackups(): Promise<BackupInfo[]> {
   const backups: BackupInfo[] = [];
 
-  if (!fs.existsSync(config.backupsPath)) {
+  // Check if directory exists by trying to read it
+  let files: string[] = [];
+  try {
+    files = await readServerDir(config.hytaleContainerBackupsPath, 'backups');
+  } catch {
     return backups;
   }
-
-  const files = fs.readdirSync(config.backupsPath);
 
   for (const file of files) {
     const ext = path.extname(file).toLowerCase();
@@ -34,12 +38,12 @@ export function listBackups(): BackupInfo[] {
       continue;
     }
 
-    const filePath = path.join(config.backupsPath, file);
+    const filePath = path.posix.join(config.hytaleContainerBackupsPath, file);
     try {
-      const stat = fs.statSync(filePath);
+      const stats = await getServerFileStats(filePath, 'backups');
 
-      // Skip if not a file or still being written (0 bytes)
-      if (!stat.isFile()) {
+      // Skip if stats is null (not a file or doesn't exist)
+      if (!stats) {
         continue;
       }
 
@@ -52,8 +56,8 @@ export function listBackups(): BackupInfo[] {
       }
 
       // Calculate size - show at least 0.01 MB for small files
-      const sizeMb = stat.size / (1024 * 1024);
-      const displaySizeMb = stat.size > 0 ? Math.max(0.01, Math.round(sizeMb * 100) / 100) : 0;
+      const sizeMb = stats.size / (1024 * 1024);
+      const displaySizeMb = stats.size > 0 ? Math.max(0.01, Math.round(sizeMb * 100) / 100) : 0;
 
       // Determine type: auto if includes 'auto', 'scheduled', or created by Hytale server
       const isAuto = file.includes('auto') ||
@@ -63,9 +67,9 @@ export function listBackups(): BackupInfo[] {
       backups.push({
         id,
         filename: file,
-        size_bytes: stat.size,
+        size_bytes: stats.size,
         size_mb: displaySizeMb,
-        created_at: stat.mtime.toISOString(),
+        created_at: stats.modified.toISOString(),
         type: isAuto ? 'auto' : 'manual',
       });
     } catch (err) {
@@ -81,8 +85,8 @@ export function listBackups(): BackupInfo[] {
   return backups;
 }
 
-export function getBackup(backupId: string): BackupInfo | null {
-  const backups = listBackups();
+export async function getBackup(backupId: string): Promise<BackupInfo | null> {
+  const backups = await listBackups();
   return backups.find((b) => b.id === backupId) || null;
 }
 
@@ -95,10 +99,10 @@ export function getBackupPath(backupId: string): string | null {
   const extensions = ['.tar.gz', '.tar', '.zip'];
 
   for (const ext of extensions) {
-    const filePath = path.join(config.backupsPath, `${backupId}${ext}`);
+    const filePath = path.join(config.hytaleContainerBackupsPath, `${backupId}${ext}`);
 
     // SECURITY: Verify path is within backups directory
-    if (!isPathSafe(filePath, [config.backupsPath])) {
+    if (!isPathSafe(filePath, [config.hytaleContainerBackupsPath])) {
       return null;
     }
 
@@ -110,50 +114,65 @@ export function getBackupPath(backupId: string): string | null {
   return null;
 }
 
-export function createBackup(name?: string): ActionResponse & { backup?: BackupInfo } {
-  if (!fs.existsSync(config.dataPath)) {
-    return { success: false, error: 'Data directory not found' };
-  }
-
+export async function createBackup(name?: string): Promise<ActionResponse & { backup?: BackupInfo }> {
   // SECURITY: Validate name if provided
   if (name && !isValidBackupName(name)) {
     return { success: false, error: 'Invalid backup name. Use only letters, numbers, underscores and hyphens.' };
   }
 
-  // Ensure backups directory exists
-  if (!fs.existsSync(config.backupsPath)) {
-    fs.mkdirSync(config.backupsPath, { recursive: true });
-  }
-
   // Generate backup name
   const timestamp = new Date().toISOString().replace(/[:.]/g, '').replace('T', '_').substring(0, 15);
   const backupName = name ? `manual_${name}_${timestamp}` : `manual_${timestamp}`;
-  const backupFile = path.join(config.backupsPath, `${backupName}.tar.gz`);
+  const backupFile = path.posix.join(config.hytaleContainerBackupsPath, `${backupName}.tar.gz`);
 
   // SECURITY: Double-check path is safe
-  if (!isPathSafe(backupFile, [config.backupsPath])) {
+  if (!isPathSafe(backupFile, [config.hytaleContainerBackupsPath])) {
     return { success: false, error: 'Invalid backup path' };
   }
 
   try {
-    // Create tarball using tar command (paths are validated, using single quotes for safety)
-    // Timeout increased to 30 minutes for large backups (1GB+)
-    execSync(`tar -czf '${backupFile}' -C '${config.dataPath}' .`, {
-      timeout: 1800000, // 30 minutes
-      maxBuffer: 1024 * 1024 * 10, // 10MB buffer for command output
-    });
+    // Ensure backups directory exists inside the container
+    const mkdirResult = await dockerService.execInGameServerContainer(
+      `mkdir -p '${config.hytaleContainerBackupsPath}'`
+    );
+    if (!mkdirResult.success) {
+      console.warn(`[Backup] Failed to create backups directory: ${mkdirResult.error}`);
+    }
 
-    const stat = fs.statSync(backupFile);
+    // Create tarball using tar command inside the container
+    // Use posix paths for container paths
+    const dataPath = config.hytaleContainerDataPath;
+    const tarCommand = `tar -czf '${backupFile}' -C '${dataPath}' .`;
+    
+    console.log(`[Backup] Creating backup: ${backupName}`);
+    console.log(`[Backup] Command: tar -czf '${backupFile}' -C '${dataPath}' .`);
+    
+    const result = await dockerService.execInGameServerContainer(tarCommand);
+    
+    if (!result.success) {
+      return { success: false, error: result.error || 'Backup command failed' };
+    }
+
+    // Get file stats from inside the container
+    const statCommand = `stat -c '%s' '${backupFile}' 2>/dev/null || stat -f '%z' '${backupFile}' 2>/dev/null || echo '0'`;
+    const statResult = await dockerService.execInGameServerContainer(statCommand);
+    
+    if (!statResult.success || !statResult.output) {
+      return { success: false, error: 'Failed to get backup file size' };
+    }
+
+    const sizeBytes = parseInt(statResult.output.trim(), 10) || 0;
+    const sizeMb = sizeBytes > 0 ? Math.max(0.01, Math.round(sizeBytes / (1024 * 1024) * 100) / 100) : 0;
 
     return {
       success: true,
       backup: {
         id: backupName,
         filename: `${backupName}.tar.gz`,
-        size_bytes: stat.size,
-        size_mb: Math.round(stat.size / (1024 * 1024) * 100) / 100,
+        size_bytes: sizeBytes,
+        size_mb: sizeMb,
         created_at: new Date().toISOString(),
-        type: 'manual',
+        type: name === 'auto' || name === 'scheduled_restart' ? 'auto' : 'manual',
       },
     };
   } catch (error) {
@@ -174,7 +193,7 @@ export function deleteBackup(backupId: string): ActionResponse {
   }
 
   // SECURITY: Verify path is safe before deletion
-  if (!isPathSafe(filePath, [config.backupsPath])) {
+  if (!isPathSafe(filePath, [config.hytaleContainerBackupsPath])) {
     return { success: false, error: 'Invalid backup path' };
   }
 
@@ -186,46 +205,90 @@ export function deleteBackup(backupId: string): ActionResponse {
   }
 }
 
-export function restoreBackup(backupId: string): ActionResponse {
+export async function restoreBackup(backupId: string): Promise<ActionResponse> {
   // SECURITY: Validate backup ID first
   if (!validateBackupId(backupId)) {
     return { success: false, error: 'Invalid backup ID' };
   }
 
-  const filePath = getBackupPath(backupId);
-
-  if (!filePath) {
-    return { success: false, error: 'Backup not found' };
+  // Get backup file path inside the container
+  // Try different extensions to find the backup file
+  const extensions = ['.tar.gz', '.tar', '.zip'];
+  let backupFile: string | null = null;
+  
+  for (const ext of extensions) {
+    const testPath = path.posix.join(config.hytaleContainerBackupsPath, `${backupId}${ext}`);
+    
+    // SECURITY: Verify path is safe
+    if (!isPathSafe(testPath, [config.hytaleContainerBackupsPath])) {
+      continue;
+    }
+    
+    // Check if file exists in container
+    const checkResult = await dockerService.execInGameServerContainer(
+      `test -f '${testPath}' && echo 'EXISTS' || echo 'NOT_FOUND'`
+    );
+    
+    if (checkResult.success && checkResult.output?.trim() === 'EXISTS') {
+      backupFile = testPath;
+      break;
+    }
   }
 
-  // SECURITY: Verify path is safe
-  if (!isPathSafe(filePath, [config.backupsPath])) {
-    return { success: false, error: 'Invalid backup path' };
+  if (!backupFile) {
+    return { success: false, error: 'Backup not found' };
   }
 
   try {
     // Create a pre-restore backup
-    createBackup('pre_restore');
+    await createBackup('pre_restore');
 
-    // Create temp directory
-    const tempDir = path.join(config.backupsPath, '_restore_temp');
-    if (fs.existsSync(tempDir)) {
-      fs.rmSync(tempDir, { recursive: true });
+    // Use posix paths for container operations
+    const tempDir = path.posix.join(config.hytaleContainerBackupsPath, '_restore_temp');
+    const dataPath = config.hytaleContainerDataPath;
+
+    console.log(`[Backup] Starting restore from: ${backupFile}`);
+    console.log(`[Backup] Temp directory: ${tempDir}`);
+    console.log(`[Backup] Data path: ${dataPath}`);
+
+    // Remove temp directory if it exists, then create it
+    const cleanupResult = await dockerService.execInGameServerContainer(
+      `rm -rf '${tempDir}' && mkdir -p '${tempDir}'`
+    );
+    if (!cleanupResult.success) {
+      return { success: false, error: `Failed to create temp directory: ${cleanupResult.error}` };
     }
-    fs.mkdirSync(tempDir, { recursive: true });
 
-    // Extract backup (paths are validated, using single quotes for safety)
-    // Timeout increased to 30 minutes for large backups (1GB+)
-    execSync(`tar -xzf '${filePath}' -C '${tempDir}'`, {
-      timeout: 1800000, // 30 minutes
-      maxBuffer: 1024 * 1024 * 10, // 10MB buffer for command output
-    });
-
-    // Clear current data and move restored data
-    if (fs.existsSync(config.dataPath)) {
-      fs.rmSync(config.dataPath, { recursive: true });
+    // Extract backup inside the container
+    console.log(`[Backup] Extracting backup...`);
+    const extractCommand = `tar -xzf '${backupFile}' -C '${tempDir}'`;
+    const extractResult = await dockerService.execInGameServerContainer(extractCommand);
+    
+    if (!extractResult.success) {
+      return { success: false, error: `Failed to extract backup: ${extractResult.error || 'Unknown error'}` };
     }
-    fs.renameSync(tempDir, config.dataPath);
+
+    // Remove current data directory
+    console.log(`[Backup] Removing current data directory...`);
+    const removeResult = await dockerService.execInGameServerContainer(
+      `rm -rf '${dataPath}'`
+    );
+    if (!removeResult.success) {
+      console.warn(`[Backup] Warning: Failed to remove old data directory: ${removeResult.error}`);
+      // Continue anyway - mv will overwrite
+    }
+
+    // Move temp directory to data path
+    console.log(`[Backup] Moving restored data to data directory...`);
+    const moveResult = await dockerService.execInGameServerContainer(
+      `mv '${tempDir}' '${dataPath}'`
+    );
+    
+    if (!moveResult.success) {
+      return { success: false, error: `Failed to move restored data: ${moveResult.error || 'Unknown error'}` };
+    }
+
+    console.log(`[Backup] Restore completed successfully`);
 
     return {
       success: true,
@@ -236,19 +299,33 @@ export function restoreBackup(backupId: string): ActionResponse {
   }
 }
 
-export function getStorageInfo(): StorageInfo {
+export async function getStorageInfo(): Promise<StorageInfo> {
   let totalSize = 0;
   let count = 0;
 
-  if (fs.existsSync(config.backupsPath)) {
-    const files = fs.readdirSync(config.backupsPath);
-    for (const file of files) {
-      const filePath = path.join(config.backupsPath, file);
-      const stat = fs.statSync(filePath);
-      if (stat.isFile()) {
-        totalSize += stat.size;
+  // Check if directory exists by trying to read it
+  let files: string[] = [];
+  try {
+    files = await readServerDir(config.hytaleContainerBackupsPath, 'backups');
+  } catch {
+    return {
+      total_size_bytes: 0,
+      total_size_mb: 0,
+      backup_count: 0,
+    };
+  }
+
+  for (const file of files) {
+    const filePath = path.posix.join(config.hytaleContainerBackupsPath, file);
+    try {
+      const stats = await getServerFileStats(filePath, 'backups');
+      if (stats) {
+        totalSize += stats.size;
         count++;
       }
+    } catch {
+      // Skip files that can't be read
+      continue;
     }
   }
 

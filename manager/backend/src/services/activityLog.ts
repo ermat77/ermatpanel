@@ -1,6 +1,5 @@
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import path from 'path';
-import { isDemoMode, getDemoActivityLog } from './demoData.js';
 
 // Activity log entry
 export interface ActivityLogEntry {
@@ -19,7 +18,24 @@ const activityLog: ActivityLogEntry[] = [];
 const MAX_LOG_ENTRIES = 500;
 
 // Path to persistent log file
-const DATA_DIR = process.env.DATA_PATH || '/app/data';
+// Manager-specific files path:
+//   - If HOST_DATA_PATH env var is set: use it (override)
+//   - If running locally: use HOST_DATA_PATH/manager
+//   - If running in Docker: default to /app/data
+function getManagerDataPath(): string {
+  if (process.env.HOST_DATA_PATH) {
+    return process.env.HOST_DATA_PATH;
+  }
+  const fs = require('fs');
+  const isInDocker = fs.existsSync('/.dockerenv') || !!process.env.DOCKER_CONTAINER;
+  if (!isInDocker) {
+    const hostDataPath = process.env.HOST_DATA_PATH || '/opt/hytale';
+    return path.join(hostDataPath, 'manager');
+  }
+  return '/app/data';
+}
+
+const DATA_DIR = getManagerDataPath();
 const LOG_FILE = path.join(DATA_DIR, 'activity-log.json');
 
 // Generate unique ID
@@ -75,11 +91,6 @@ export async function logActivity(
     success,
   };
 
-  // Demo mode: return entry without persisting
-  if (isDemoMode()) {
-    return entry;
-  }
-
   activityLog.push(entry);
 
   // Keep only recent entries in memory
@@ -100,43 +111,6 @@ export function getActivityLog(options?: {
   category?: ActivityLogEntry['category'];
   user?: string;
 }): { entries: ActivityLogEntry[]; total: number } {
-  // Demo mode: return demo activity entries
-  if (isDemoMode()) {
-    const demoEntries = getDemoActivityLog();
-    // Map demo entries to ActivityLogEntry format
-    let entries: ActivityLogEntry[] = demoEntries.map(e => ({
-      id: e.id,
-      timestamp: e.timestamp,
-      user: e.user,
-      action: e.action,
-      target: undefined,
-      details: e.details,
-      category: e.category as ActivityLogEntry['category'],
-      success: true,
-    }));
-
-    // Filter by category
-    if (options?.category) {
-      entries = entries.filter(e => e.category === options.category);
-    }
-    // Filter by user
-    if (options?.user) {
-      entries = entries.filter(e => e.user === options.user);
-    }
-
-    const total = entries.length;
-
-    // Apply pagination
-    if (options?.offset) {
-      entries = entries.slice(options.offset);
-    }
-    if (options?.limit) {
-      entries = entries.slice(0, options.limit);
-    }
-
-    return { entries, total };
-  }
-
   let entries = [...activityLog].reverse(); // Most recent first
 
   // Filter by category
@@ -164,11 +138,6 @@ export function getActivityLog(options?: {
 
 // Clear activity log
 export async function clearActivityLog(): Promise<void> {
-  // Demo mode: return without persisting
-  if (isDemoMode()) {
-    return;
-  }
-
   activityLog.length = 0;
   await saveLogs();
 }

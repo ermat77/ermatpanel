@@ -6,24 +6,12 @@ import { parseLogLine } from './services/logs.js';
 import { processLogLine } from './services/players.js';
 import { hasPermission } from './services/roles.js';
 import type { WsMessage } from './types/index.js';
-import { isDemoMode, getNextDemoLogLine, getDemoOnlinePlayers } from './services/demoData.js';
-import * as fs from 'fs';
-import * as path from 'path';
-import { config } from './config.js';
 
 const clients = new Set<WebSocket>();
 // Map to store username for each WebSocket connection (for permission checks)
 const clientUsernames = new Map<WebSocket, string>();
 let logStream: NodeJS.ReadableStream | null = null;
 let streamRestartTimeout: NodeJS.Timeout | null = null;
-let demoLogInterval: NodeJS.Timeout | null = null;
-
-/**
- * Check if we're running in local development (not in Docker)
- */
-function isLocalDevelopment(): boolean {
-  return !process.env.GAME_CONTAINER_NAME && !process.env.STACK_NAME;
-}
 
 async function sendExistingLogs(ws: WebSocket): Promise<void> {
   try {
@@ -210,179 +198,13 @@ function demuxDockerStream(chunk: Buffer): string[] {
   return results;
 }
 
-// Demo mode: simulate log streaming with periodic log messages
-function startDemoLogStreaming(): void {
-  if (demoLogInterval) {
-    clearInterval(demoLogInterval);
-  }
-
-  console.log('[DEMO] Demo log streaming started');
-
-  // Send a log message every 3-8 seconds
-  demoLogInterval = setInterval(() => {
-    if (clients.size === 0) {
-      stopDemoLogStreaming();
-      return;
-    }
-
-    const logLine = getNextDemoLogLine();
-    const parsed = parseLogLine(logLine);
-
-    if (parsed) {
-      broadcast({
-        type: 'log',
-        ...parsed,
-      });
-
-      // Check for player events in demo logs
-      const playerEvent = processLogLine(logLine);
-      if (playerEvent) {
-        broadcast({
-          type: 'player_event',
-          event: playerEvent.event,
-          player: playerEvent.player,
-          timestamp: new Date().toISOString(),
-        });
-      }
-    }
-  }, 3000 + Math.random() * 5000); // Random interval 3-8 seconds
-}
-
-function stopDemoLogStreaming(): void {
-  if (demoLogInterval) {
-    clearInterval(demoLogInterval);
-    demoLogInterval = null;
-    console.log('[DEMO] Demo log streaming stopped');
-  }
-}
 
 /**
- * Start file-based log streaming for local development
+ * Start log streaming
+ * Always uses Docker container logs API, regardless of backend location
  */
-function startLocalLogStreaming(): void {
-  // Clear any pending restart timeout
-  if (streamRestartTimeout) {
-    clearTimeout(streamRestartTimeout);
-    streamRestartTimeout = null;
-  }
-
-  // Clean up existing stream
-  if (logStream) {
-    logStream.removeAllListeners();
-    logStream = null;
-  }
-
-  // Try to find log file in server directory
-  // In local dev, the directory is typically 'hytale-server' not 'server'
-  const baseServerPath = config.serverPath.includes('hytale-server') 
-    ? config.serverPath 
-    : path.resolve(config.serverPath, '..', 'hytale-server');
-  
-  const logPaths = [
-    path.join(baseServerPath, 'logs', 'latest.log'),
-    path.join(baseServerPath, 'logs', 'server.log'),
-    path.join(baseServerPath, 'server.log'),
-    path.join(config.dataPath, 'logs', 'latest.log'),
-    // Fallback to original serverPath if hytale-server doesn't exist
-    path.join(config.serverPath, 'logs', 'latest.log'),
-    path.join(config.serverPath, 'logs', 'server.log'),
-    path.join(config.serverPath, 'server.log'),
-  ];
-
-  let logFile: string | null = null;
-  for (const logPath of logPaths) {
-    if (fs.existsSync(logPath)) {
-      logFile = logPath;
-      break;
-    }
-  }
-
-  if (!logFile) {
-    console.warn('[Local Dev] No log file found. Tried:', logPaths);
-    console.warn('[Local Dev] Log streaming disabled. Server logs may not appear in real-time.');
-    return;
-  }
-
-  console.log(`[Local Dev] Watching log file: ${logFile}`);
-
-  try {
-    // Use fs.watchFile for cross-platform file watching
-    let lastSize = fs.statSync(logFile).size;
-    let lastPosition = lastSize;
-
-    const watchInterval = setInterval(() => {
-      if (clients.size === 0) {
-        clearInterval(watchInterval);
-        return;
-      }
-
-      try {
-        const stats = fs.statSync(logFile!);
-        if (stats.size > lastPosition) {
-          // Read new content
-          const fd = fs.openSync(logFile!, 'r');
-          const buffer = Buffer.alloc(stats.size - lastPosition);
-          fs.readSync(fd, buffer, 0, buffer.length, lastPosition);
-          fs.closeSync(fd);
-
-          lastPosition = stats.size;
-
-          const lines = buffer.toString('utf-8').split('\n');
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-
-            const parsed = parseLogLine(trimmed);
-            if (parsed) {
-              broadcast({
-                type: 'log',
-                ...parsed,
-              });
-
-              // Check for player events
-              const playerEvent = processLogLine(trimmed);
-              if (playerEvent) {
-                broadcast({
-                  type: 'player_event',
-                  ...playerEvent,
-                  timestamp: new Date().toISOString(),
-                });
-              }
-            }
-          }
-        }
-      } catch (error) {
-        console.error('[Local Dev] Error reading log file:', error);
-        clearInterval(watchInterval);
-        scheduleStreamRestart();
-      }
-    }, 500); // Check every 500ms
-
-    logStream = {
-      removeAllListeners: () => clearInterval(watchInterval),
-    } as NodeJS.ReadableStream;
-
-    console.log('[Local Dev] Log streaming started');
-  } catch (error) {
-    console.error('[Local Dev] Failed to start log streaming:', error);
-    scheduleStreamRestart();
-  }
-}
-
 async function startLogStreaming(): Promise<void> {
-  // Demo mode: use simulated log streaming
-  if (isDemoMode()) {
-    startDemoLogStreaming();
-    return;
-  }
-
-  // Local development: use file-based log streaming
-  if (isLocalDevelopment()) {
-    startLocalLogStreaming();
-    return;
-  }
-
-  // Docker mode: use container logs
+  // Always use Docker logs API - server is always in Docker
   // Clear any pending restart timeout
   if (streamRestartTimeout) {
     clearTimeout(streamRestartTimeout);
@@ -408,7 +230,7 @@ async function startLogStreaming(): Promise<void> {
     });
 
     logStream = stream;
-    console.log('Log streaming started (Docker)');
+    console.log('Log streaming started (Docker API)');
 
     stream.on('data', (chunk: Buffer) => {
       // Try to demux the Docker stream
@@ -492,9 +314,6 @@ function scheduleStreamRestart(): void {
 }
 
 function stopLogStreaming(): void {
-  // Stop demo streaming if active
-  stopDemoLogStreaming();
-
   if (streamRestartTimeout) {
     clearTimeout(streamRestartTimeout);
     streamRestartTimeout = null;

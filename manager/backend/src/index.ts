@@ -6,14 +6,15 @@ import { createServer, IncomingMessage, ServerResponse } from 'http';
 import { createGunzip, createInflate } from 'zlib';
 import { WebSocketServer } from 'ws';
 import path from 'path';
+import * as fs from 'fs';
 import { fileURLToPath } from 'url';
-import { access, constants, writeFile as fsWriteFile, unlink } from 'fs/promises';
 import { randomBytes } from 'crypto';
 import { createProxyMiddleware } from 'http-proxy-middleware';
 import httpProxy from 'http-proxy';
 
 import { config, checkSecurityConfig } from './config.js';
 import { setupWebSocket } from './websocket.js';
+import * as dockerService from './services/docker.js';
 
 // Routes
 import authRoutes from './routes/auth.js';
@@ -26,6 +27,8 @@ import schedulerRoutes from './routes/scheduler.js';
 import assetsRoutes from './routes/assets.js';
 import rolesRouter from './routes/roles.js';
 import setupRoutes from './routes/setup.js';
+import hytaleDownloaderRoutes from './routes/hytaleDownloader.js';
+import serverFilesRoutes from './routes/serverFiles.js';
 
 // Services
 import { startSchedulers } from './services/scheduler.js';
@@ -260,7 +263,7 @@ app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "'unsafe-eval'"], // Vue.js needs unsafe-eval for template compilation
+      scriptSrc: ["'self'", "'unsafe-eval'", "'unsafe-inline'"], // Vue.js needs unsafe-eval and unsafe-inline for template compilation and inline scripts
       styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"], // Vue/CSS-in-JS + Google Fonts
       imgSrc: ["'self'", "data:", "blob:", "https://cdn.modtale.net", "https://stackmart.org"], // Allow data URIs, Modtale CDN and StackMart
       fontSrc: ["'self'", "data:", "https://fonts.gstatic.com"], // Google Fonts
@@ -304,6 +307,11 @@ app.use((req, res, next) => {
     return next();
   }
 
+  // Skip for setup routes (no config.json exists yet during setup)
+  if (req.path.startsWith('/api/setup')) {
+    return next();
+  }
+
   // Skip for WebMap proxy routes (these are proxied to the game server, not our API)
   if (req.path.startsWith('/api/webmap') || req.path.startsWith('/api/worlds') || req.path.startsWith('/api/tiles')) {
     return next();
@@ -329,7 +337,7 @@ app.use((req, res, next) => {
     return next();
   }
 
-  const allowedOrigins = config.corsOrigins.split(',').map(o => o.trim());
+  const allowedOrigins = config.corsOrigins.split(',').map(o => o.trim()).filter(o => o !== '');
 
   // Also allow requests from the server's own origin (same-origin)
   const host = req.headers.host;
@@ -419,6 +427,8 @@ app.use('/api/management', managementRoutes);
 app.use('/api/scheduler', schedulerRoutes);
 app.use('/api/assets', assetsRoutes);
 app.use('/api/roles', rolesRouter);
+app.use('/api/hytale-downloader', hytaleDownloaderRoutes);
+app.use('/api/server-files', serverFilesRoutes);
 
 // Health check
 app.get('/api/health', (_req, res) => {
@@ -442,16 +452,42 @@ interface PermissionHealthResponse {
 }
 
 app.get('/api/health/permissions', async (_req, res) => {
-  const pathsToCheck = [
-    { path: config.serverPath, name: 'Server' },
-    { path: config.backupsPath, name: 'Backups' },
-    { path: config.dataPath, name: 'Data' },
-    { path: config.modsPath, name: 'Mods' },
-    { path: config.modsPath, name: 'Plugins' },
-  ];
+  // Determine correct paths based on environment:
+  // - In Docker: Use container paths (mounted volumes)
+  // - In dev: Use host paths (absolute paths on host machine)
+  const isInDocker = fs.existsSync('/.dockerenv') || !!process.env.DOCKER_CONTAINER;
+  const pathsToCheck = isInDocker
+    ? [
+        { path: config.hytaleContainerServerPath, name: 'Server' },
+        { path: config.hytaleContainerBackupsPath, name: 'Backups' },
+        { path: config.hytaleContainerDataPath, name: 'Data' },
+        { path: config.hytaleContainerModsPath, name: 'Mods' },
+      ]
+    : [
+        { path: path.join(config.hostDataPath, 'server'), name: 'Server' },
+        { path: path.join(config.hostDataPath, 'backups'), name: 'Backups' },
+        { path: path.join(config.hostDataPath, 'data'), name: 'Data' },
+        { path: path.join(config.hostDataPath, 'mods'), name: 'Mods' },
+      ];
 
   const results: PermissionCheckResult[] = [];
   let hasIssues = false;
+
+  // Check if container is running first
+  const containerStatus = await dockerService.getStatus();
+  if (!containerStatus.running) {
+    return res.json({
+      ok: false,
+      issues: pathsToCheck.map(({ path: dirPath, name }) => ({
+        path: dirPath,
+        name,
+        readable: false,
+        writable: false,
+        error: 'Container not running',
+      })),
+      message: 'Cannot check permissions: Container is not running',
+    });
+  }
 
   for (const { path: dirPath, name } of pathsToCheck) {
     const result: PermissionCheckResult = {
@@ -462,19 +498,43 @@ app.get('/api/health/permissions', async (_req, res) => {
     };
 
     try {
-      // Check if directory is readable
-      await access(dirPath, constants.R_OK);
-      result.readable = true;
+      // Check if directory is readable using Docker API
+      const readCheck = await dockerService.execInGameServerContainer(
+        `test -r "${dirPath}" && echo "READABLE" || echo "NOT_READABLE"`
+      );
+      
+      if (readCheck.success && readCheck.output?.includes('READABLE')) {
+        result.readable = true;
 
-      // Check if directory is writable by actually trying to write a temp file
-      const testFile = path.join(dirPath, `.perm-test-${randomBytes(4).toString('hex')}`);
-      try {
-        await fsWriteFile(testFile, 'test', 'utf-8');
-        await unlink(testFile);
-        result.writable = true;
-      } catch (writeErr) {
-        result.writable = false;
-        result.error = `Cannot write: ${writeErr instanceof Error ? writeErr.message : 'Unknown error'}`;
+        // Check if directory is writable by trying to write a test file via Docker API
+        const testFileName = `.perm-test-${randomBytes(4).toString('hex')}`;
+        const testFilePath = path.posix.join(dirPath, testFileName);
+        
+        try {
+          // Try to write a test file
+          await dockerService.writeContainerFile(testFilePath, 'test');
+          
+          // Try to read it back
+          await dockerService.readContainerFile(testFilePath);
+          
+          // Delete the test file
+          const deleteResult = await dockerService.execInGameServerContainer(`rm -f "${testFilePath}"`);
+          
+          if (deleteResult.success) {
+            result.writable = true;
+          } else {
+            result.writable = false;
+            result.error = `Cannot delete test file: ${deleteResult.error || 'Unknown error'}`;
+            hasIssues = true;
+          }
+        } catch (writeErr) {
+          result.writable = false;
+          result.error = `Cannot write: ${writeErr instanceof Error ? writeErr.message : 'Unknown error'}`;
+          hasIssues = true;
+        }
+      } else {
+        result.readable = false;
+        result.error = `Cannot access: ${readCheck.error || 'Directory not readable'}`;
         hasIssues = true;
       }
     } catch (readErr) {
@@ -569,7 +629,7 @@ process.on('unhandledRejection', (reason, promise) => {
 server.listen(config.port, '0.0.0.0', async () => {
   console.log(`
 ╔═══════════════════════════════════════════════════╗
-║         KyuubiSoft Panel v2.1.1                   ║
+║         Ermat Panel v2.1.1                        ║
 ║         Hytale Server Management                  ║
 ╠═══════════════════════════════════════════════════╣
 ║  Panel: http://localhost:${config.externalPort.toString().padEnd(23)}║
