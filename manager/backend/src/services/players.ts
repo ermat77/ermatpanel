@@ -242,13 +242,13 @@ function isValidPlayerName(name: string): boolean {
 
 // File path for the unified players.json (backend data file, not server file)
 async function getPlayersPath(): Promise<string> {
-  return path.join(config.hytaleContainerDataPath, 'players.json');
+  return path.join(config.hytaleContainerServerPath, 'players.json');
 }
 
 // Ensure data directory exists
 async function ensureDataDir(): Promise<void> {
   try {
-    await mkdir(config.hytaleContainerDataPath, { recursive: true });
+    await mkdir(config.hytaleContainerServerPath, { recursive: true });
   } catch {
     // Directory may already exist
   }

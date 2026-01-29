@@ -1,7 +1,9 @@
 import { readFile, writeFile, mkdir, access, constants } from 'fs/promises';
+import { readdir, stat } from 'fs/promises';
 import path from 'path';
 import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
+import { spawn } from 'child_process';
 import { config, reloadConfigFromFile } from '../config.js';
 import * as dockerService from './docker.js';
 import { runSystemChecks as runSystemChecksFromService, type SystemCheck, type SystemCheckResult } from './systemCheck.js';
@@ -124,37 +126,27 @@ export interface DownloadProgress {
 
 // Server download progress
 export interface ServerDownloadProgress {
-  status: 'idle' | 'downloading-downloader' | 'extracting-downloader' | 'downloading-server' | 'extracting-server' | 'complete' | 'error';
+  status: 'idle' | 'downloading-downloader' | 'extracting-downloader' | 'downloading-server' | 'extracting-server' | 'copying-to-container' | 'complete' | 'error';
   currentStep: string;
   stepProgress: number;
   overallProgress: number;
   message: string;
   error?: string;
+  /** Streamed stdout lines from the downloader (auth links, progress, etc.) */
+  stdoutLines: string[];
+  /** OAuth/device-login URL extracted from downloader output for user to click and authenticate */
+  authUrl?: string;
+  /** Parsed download percent (0–100) when downloader reports progress */
+  downloadPercent?: number;
+  downloadMb?: number;
+  downloadTotalGb?: number;
+  /** When manual copy is required, the docker cp command parts for the frontend to display */
+  dockerCp?: { sourcePath: string; containerName: string; containerPath: string };
 }
 
-// Paths
-// Manager-specific files path:
-//   - If HOST_DATA_PATH env var is set: use it (override)
-//   - If running locally: use HOST_DATA_PATH/manager
-//   - If running in Docker: default to /app/data
-// For config.json, we also need to write to game server data path for compatibility
-function getManagerDataPath(): string {
-  if (process.env.HOST_DATA_PATH) {
-    return process.env.HOST_DATA_PATH;
-  }
-  const fs = require('fs');
-  const isInDocker = fs.existsSync('/.dockerenv') || !!process.env.DOCKER_CONTAINER;
-  if (!isInDocker) {
-    const hostDataPath = process.env.HOST_DATA_PATH || '/opt/hytale';
-    return path.join(hostDataPath, 'manager');
-  }
-  return '/app/data';
-}
-
-const MANAGER_DATA_DIR = getManagerDataPath();
-
-console.log('MANAGER_DATA_DIR', MANAGER_DATA_DIR);
-const GAME_DATA_DIR = process.env.HYTALE_CONTAINER_DATA_PATH || process.env.DATA_PATH || '/opt/hytale/data';
+// Paths (manager data path and game container data path from config)
+const MANAGER_DATA_DIR = config.managerDataPath;
+const GAME_DATA_DIR = config.hytaleContainerServerPath;
 const SETUP_CONFIG_FILE = path.join(MANAGER_DATA_DIR, 'setup-config.json');
 const PANEL_CONFIG_FILE = path.join(MANAGER_DATA_DIR, 'panel-config.json');
 // config.json is written to both locations for compatibility
@@ -204,7 +196,11 @@ let serverDownloadProgress: ServerDownloadProgress = {
   stepProgress: 0,
   overallProgress: 0,
   message: '',
+  stdoutLines: [],
 };
+
+/** Listeners to push progress immediately when setServerDownloadProgress is called (SSE clients) */
+const serverDownloadProgressListeners = new Set<(progress: ServerDownloadProgress) => void>();
 
 // Ensure data directories exist
 async function ensureDataDir(): Promise<void> {
@@ -220,7 +216,6 @@ async function ensureDataDir(): Promise<void> {
 // Read setup config from file
 async function readSetupConfig(): Promise<SetupConfig> {
   try {
-    console.log('READING SETUP CONFIG FROM', SETUP_CONFIG_FILE);
     const content = await readFile(SETUP_CONFIG_FILE, 'utf-8');
     return JSON.parse(content) as SetupConfig;
   } catch {
@@ -654,10 +649,17 @@ export async function finalizeSetup(): Promise<{ success: boolean; error?: strin
 
     // Write the main config.json with jwtSecret for the auth service
     // This is the config that gets loaded at application startup
+    // CORS: include domain from setup (if set) plus any origins from CORS_ORIGINS env (e.g. dev)
+    const domainOrigin = setupConfig.network?.domain ? [setupConfig.network.domain] : [];
+    const envOrigins = process.env.CORS_ORIGINS
+      ? process.env.CORS_ORIGINS.split(',').map(o => o.trim()).filter(Boolean)
+      : [];
+    const corsOrigins = [...new Set([...domainOrigin, ...envOrigins])];
+
     const mainConfig = {
       setupComplete: true,
       jwtSecret: jwtSecret,
-      corsOrigins: setupConfig.network?.domain ? [setupConfig.network.domain] : [],
+      corsOrigins,
       network: {
         trustProxy: setupConfig.network?.trustProxy ?? false,
         accessMode: setupConfig.network?.accessMode ?? 'local',
@@ -800,14 +802,31 @@ export function setExtractionProgress(progress: Partial<ExtractionProgress>): vo
   extractionProgress = { ...extractionProgress, ...progress };
 }
 
+/** Recursive directory size in bytes (direct fs). */
+async function getDirSizeBytes(dirPath: string): Promise<number> {
+  let total = 0;
+  const entries = await readdir(dirPath, { withFileTypes: true });
+  for (const entry of entries) {
+    const fullPath = path.join(dirPath, entry.name);
+    const st = await stat(fullPath);
+    if (st.isDirectory()) {
+      total += await getDirSizeBytes(fullPath);
+    } else {
+      total += st.size;
+    }
+  }
+  return total;
+}
+
 /**
  * Start assets extraction
  */
 export async function startAssetsExtraction(): Promise<{ success: boolean; error?: string }> {
   try {
-    const assetsZipPath = path.join(config.hytaleContainerServerPath, 'Assets.zip');
+    const assetsZipPath = path.join(config.gameDataPath, 'Assets.zip');
+    const extractPath = config.effectiveAssetsPath;
 
-    // Check if Assets.zip exists
+    // Check if Assets.zip exists (direct fs on shared path)
     try {
       await access(assetsZipPath, constants.R_OK);
     } catch {
@@ -830,57 +849,69 @@ export async function startAssetsExtraction(): Promise<{ success: boolean; error
       estimatedSeconds: 0,
     };
 
-    // Start extraction in background via Docker exec
-    // The actual extraction would be done by the game container or a worker
-    const extractPath = config.hytaleContainerAssetsPath;
-
-    // Ensure extract directory exists
+    // Ensure extract directory exists (direct fs)
     await mkdir(extractPath, { recursive: true }).catch(() => {});
 
-    // Run unzip via docker exec (in the game container which has the tools)
-    dockerService.execInGameServerContainer(
-      `unzip -o "${assetsZipPath}" -d "${extractPath}" 2>&1`
-    ).then(async (result) => {
-      if (result.success) {
-        // Get directory size
-        const sizeResult = await dockerService.execInGameServerContainer(
-          `du -sb "${extractPath}" | cut -f1`
-        );
-        const sizeBytes = sizeResult.success && sizeResult.output
-          ? parseInt(sizeResult.output.trim(), 10)
-          : 0;
+    // Run unzip from backend process (shared path)
+    const unzipProc = spawn('unzip', ['-o', assetsZipPath, '-d', extractPath], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
 
-        extractionProgress = {
-          status: 'complete',
-          filesTotal: 100,
-          filesDone: 100,
-          bytesTotal: sizeBytes,
-          bytesDone: sizeBytes,
-          currentFile: 'Extraction complete',
-          estimatedSeconds: 0,
-        };
+    unzipProc.on('close', (code) => {
+      if (code === 0) {
+        getDirSizeBytes(extractPath).then(async (sizeBytes) => {
+          extractionProgress = {
+            status: 'complete',
+            filesTotal: 100,
+            filesDone: 100,
+            bytesTotal: sizeBytes,
+            bytesDone: sizeBytes,
+            currentFile: 'Extraction complete',
+            estimatedSeconds: 0,
+          };
 
-        // Update setup config
-        const setupConfig = await readSetupConfig();
-        setupConfig.assets = {
-          extracted: true,
-          extractedAt: new Date().toISOString(),
-          path: extractPath,
-          sizeBytes,
-        };
-        await writeSetupConfig(setupConfig);
+          const setupConfig = await readSetupConfig();
+          setupConfig.assets = {
+            extracted: true,
+            extractedAt: new Date().toISOString(),
+            path: extractPath,
+            sizeBytes,
+          };
+          await writeSetupConfig(setupConfig);
+        }).catch(async () => {
+          extractionProgress = {
+            ...extractionProgress,
+            status: 'complete',
+            filesTotal: 100,
+            filesDone: 100,
+            bytesTotal: 0,
+            bytesDone: 0,
+            currentFile: 'Extraction complete',
+            estimatedSeconds: 0,
+          };
+          const setupConfig = await readSetupConfig();
+          setupConfig.assets = {
+            extracted: true,
+            extractedAt: new Date().toISOString(),
+            path: extractPath,
+            sizeBytes: 0,
+          };
+          await writeSetupConfig(setupConfig);
+        });
       } else {
         extractionProgress = {
           ...extractionProgress,
           status: 'error',
-          error: result.error || 'Extraction failed',
+          error: `unzip exited with code ${code}`,
         };
       }
-    }).catch((error) => {
+    });
+
+    unzipProc.on('error', (err) => {
       extractionProgress = {
         ...extractionProgress,
         status: 'error',
-        error: error instanceof Error ? error.message : 'Extraction failed',
+        error: err.message || 'Extraction failed',
       };
     });
 
@@ -915,32 +946,62 @@ export function getServerDownloadProgress(): ServerDownloadProgress {
 }
 
 /**
- * Set server download progress (called by download process)
+ * Subscribe to server download progress. Listener is called immediately whenever setServerDownloadProgress is called.
+ * Used by SSE endpoint to push progress to the frontend in real time (e.g. authUrl, stdout lines).
  */
-export function setServerDownloadProgress(progress: Partial<ServerDownloadProgress>): void {
-  serverDownloadProgress = { ...serverDownloadProgress, ...progress };
+export function subscribeServerDownloadProgress(listener: (progress: ServerDownloadProgress) => void): () => void {
+  serverDownloadProgressListeners.add(listener);
+  return () => serverDownloadProgressListeners.delete(listener);
+}
+
+/**
+ * Set server download progress (called by download process).
+ * Use stdoutLine to append a single line to stdoutLines.
+ * Notifies all subscribed listeners immediately so SSE clients get updates (e.g. authUrl) without waiting for poll interval.
+ */
+export function setServerDownloadProgress(progress: Partial<ServerDownloadProgress> & { stdoutLine?: string }): void {
+  const { stdoutLine, ...rest } = progress;
+  let next = { ...serverDownloadProgress, ...rest };
+  if (stdoutLine !== undefined) {
+    next.stdoutLines = [...serverDownloadProgress.stdoutLines, stdoutLine];
+  }
+  if (rest.status === 'downloading-downloader' && serverDownloadProgress.status !== 'downloading-downloader') {
+    next.stdoutLines = [];
+    next.authUrl = undefined;
+  }
+  serverDownloadProgress = next;
+
+  const payload = { ...serverDownloadProgress, stdoutLines: serverDownloadProgress.stdoutLines ?? [] };
+  for (const listener of serverDownloadProgressListeners) {
+    try {
+      listener(payload);
+    } catch (err) {
+      console.error('[SetupService] Server download progress listener error:', err);
+    }
+  }
 }
 
 /**
  * Start server download process
- * Uses the separated hytaleDownloader and serverFileDownloader services
+ * Uses gameFilesService: ensure downloader installed, then download and extract game files, copy to container
  */
 export async function startServerDownload(): Promise<{ success: boolean; error?: string }> {
   try {
     console.log('[SetupService] Starting server download process...');
 
-    // Import here to avoid circular dependency
-    const { installDownloader } = await import('./hytaleDownloader.js');
-    const { downloadAndExtractServerFiles } = await import('./serverFileDownloader.js');
+    const { downloadAndExtractGameFiles } = await import('./gameFilesService.js');
 
-    // Progress callback to update setup service progress
     const onProgress = (progress: {
       step: string;
       stepProgress: number;
       overallProgress: number;
       message: string;
+      stdoutLine?: string;
+      authUrl?: string;
+      downloadPercent?: number;
+      downloadMb?: number;
+      downloadTotalGb?: number;
     }) => {
-      // Map step names to status values
       let status: ServerDownloadProgress['status'] = 'idle';
       if (progress.step === 'downloading-downloader') {
         status = 'downloading-downloader';
@@ -950,10 +1011,25 @@ export async function startServerDownload(): Promise<{ success: boolean; error?:
         status = 'downloading-server';
       } else if (progress.step === 'extracting-server') {
         status = 'extracting-server';
+      } else if (progress.step === 'copying-to-container') {
+        status = 'copying-to-container';
       } else if (progress.step === 'complete') {
         status = 'complete';
       }
 
+      if (progress.stdoutLine !== undefined) {
+        setServerDownloadProgress({ stdoutLine: progress.stdoutLine });
+      }
+      if (progress.authUrl !== undefined) {
+        setServerDownloadProgress({ authUrl: progress.authUrl });
+      }
+      if (progress.downloadPercent !== undefined || progress.downloadMb !== undefined || progress.downloadTotalGb !== undefined) {
+        setServerDownloadProgress({
+          ...(progress.downloadPercent !== undefined && { downloadPercent: progress.downloadPercent }),
+          ...(progress.downloadMb !== undefined && { downloadMb: progress.downloadMb }),
+          ...(progress.downloadTotalGb !== undefined && { downloadTotalGb: progress.downloadTotalGb }),
+        });
+      }
       setServerDownloadProgress({
         status,
         currentStep: progress.step,
@@ -963,7 +1039,6 @@ export async function startServerDownload(): Promise<{ success: boolean; error?:
       });
     };
 
-    // Step 1: Install downloader (download and extract)
     setServerDownloadProgress({
       status: 'downloading-downloader',
       currentStep: 'downloading-downloader',
@@ -972,21 +1047,7 @@ export async function startServerDownload(): Promise<{ success: boolean; error?:
       message: 'Starting downloader installation...',
     });
 
-    const downloaderResult = await installDownloader(onProgress);
-    if (!downloaderResult.success) {
-      setServerDownloadProgress({
-        status: 'error',
-        currentStep: 'downloading-downloader',
-        stepProgress: 0,
-        overallProgress: 0,
-        message: 'Failed to install downloader',
-        error: downloaderResult.error,
-      });
-      return { success: false, error: downloaderResult.error };
-    }
-
-    // Step 2: Download and extract server files
-    const serverFilesResult = await downloadAndExtractServerFiles(undefined, onProgress);
+    const serverFilesResult = await downloadAndExtractGameFiles(undefined, onProgress);
     if (!serverFilesResult.success) {
       setServerDownloadProgress({
         status: 'error',
@@ -999,13 +1060,16 @@ export async function startServerDownload(): Promise<{ success: boolean; error?:
       return { success: false, error: serverFilesResult.error };
     }
 
-    // Success!
+    // Success – user must manually copy files to the game container
     setServerDownloadProgress({
       status: 'complete',
       currentStep: 'complete',
       stepProgress: 100,
       overallProgress: 100,
-      message: 'Server download and extraction completed successfully',
+      message: serverFilesResult.manualCopyRequired
+        ? 'Server files ready. Copy to game container using the command below.'
+        : 'Server download and extraction completed successfully',
+      ...(serverFilesResult.dockerCp && { dockerCp: serverFilesResult.dockerCp }),
     });
 
     // Update setup config

@@ -1,11 +1,12 @@
 import Docker from 'dockerode';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
+import { spawn } from 'child_process';
 import { config } from '../config.js';
 import type { ServerStatus, ServerStats, ActionResponse } from '../types/index.js';
 import { validateCommand, escapeShellArg } from '../utils/sanitize.js';
 import { clearOnlinePlayers } from './players.js';
-import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
 
 /**
  * Get the Docker socket path based on the operating system
@@ -444,17 +445,23 @@ export async function execCommand(command: string): Promise<ActionResponse> {
 
 // Execute a shell command inside the container and capture output
 export async function execInGameServerContainer(command: string): Promise<ActionResponse & { output?: string }> {
+  const logPrefix = '[Docker] execInGameServerContainer';
+  console.log(`${logPrefix} Running command: ${command}`);
 
   try {
     const container = await getContainer();
     if (!container) {
+      console.error(`${logPrefix} Container not found (name: ${config.gameContainerName})`);
       return { success: false, error: 'Container not found' };
     }
 
     const info = await container.inspect();
+    const containerName = info.Name?.replace(/^\//, '') ?? config.gameContainerName;
     if (!info.State.Running) {
+      console.error(`${logPrefix} Container "${containerName}" is not running`);
       return { success: false, error: 'Container not running' };
     }
+    console.log(`${logPrefix} Container "${containerName}" (id: ${info.Id?.slice(0, 12)}), creating exec...`);
 
     const exec = await container.exec({
       Cmd: ['sh', '-c', command],
@@ -479,10 +486,15 @@ export async function execInGameServerContainer(command: string): Promise<Action
         // Docker streams can contain control characters like \x1D (Group Separator) in stream framing
         // Remove all control characters (0x00-0x1F) except newline (0x0A), carriage return (0x0D), and tab (0x09)
         const cleanOutput = output.replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F]/g, '').trim();
+        if (cleanOutput) {
+          console.log(`${logPrefix} Command output: ${cleanOutput}`);
+        }
+        console.log(`${logPrefix} Command finished successfully`);
         resolve({ success: true, output: cleanOutput });
       });
 
       stream.on('error', (err: Error) => {
+        console.error(`${logPrefix} Stream error:`, err.message);
         resolve({ success: false, error: err.message });
       });
 
@@ -491,530 +503,22 @@ export async function execInGameServerContainer(command: string): Promise<Action
         // Docker streams can contain control characters like \x1D (Group Separator) in stream framing
         // Remove all control characters (0x00-0x1F) except newline (0x0A), carriage return (0x0D), and tab (0x09)
         const cleanOutput = output.replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F]/g, '').trim();
+        if (cleanOutput) {
+          console.log(`${logPrefix} Command output (timeout): ${cleanOutput}`);
+        }
+        console.log(`${logPrefix} Command finished (timeout fallback)`);
         resolve({ success: true, output: cleanOutput });
       }, 5000);
     });
   } catch (error) {
-    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    const errMsg = error instanceof Error ? error.message : 'Unknown error';
+    console.error(`${logPrefix} Exception:`, errMsg, error);
+    return { success: false, error: errMsg };
   }
 }
 
 export function getDockerInstance(): Docker {
   return docker;
-}
-
-/**
- * Read directory contents from Docker container
- */
-export async function readContainerDir(containerPath: string): Promise<string[]> {
-  try {
-    const container = await getContainer();
-    if (!container) {
-      throw new Error('Container not found');
-    }
-
-    const info = await container.inspect();
-    if (!info.State.Running) {
-      throw new Error('Container not running');
-    }
-
-    // Execute ls command to list directory contents
-    const exec = await container.exec({
-      Cmd: ['sh', '-c', `ls -1 "${containerPath}" 2>/dev/null || echo ""`],
-      AttachStdout: true,
-      AttachStderr: true,
-    });
-
-    const stream = await exec.start({});
-    let output = '';
-
-    return new Promise((resolve, reject) => {
-      stream.on('data', (chunk: Buffer) => {
-        const data = chunk.toString('utf8');
-        output += data;
-      });
-
-      stream.on('end', () => {
-        // Clean up docker stream headers and control characters
-        // Docker streams can contain control characters like \x1D (Group Separator) in stream framing
-        // Remove all control characters (0x00-0x1F) except newline (0x0A), carriage return (0x0D), and tab (0x09)
-        const cleanOutput = output.replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F]/g, '').trim();
-        const files = cleanOutput ? cleanOutput.split('\n').filter(f => f.length > 0) : [];
-        resolve(files);
-      });
-
-      stream.on('error', (err: Error) => {
-        reject(err);
-      });
-
-      setTimeout(() => {
-        // Clean up docker stream headers and control characters
-        // Docker streams can contain control characters like \x1D (Group Separator) in stream framing
-        // Remove all control characters (0x00-0x1F) except newline (0x0A), carriage return (0x0D), and tab (0x09)
-        const cleanOutput = output.replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F]/g, '').trim();
-        const files = cleanOutput ? cleanOutput.split('\n').filter(f => f.length > 0) : [];
-        resolve(files);
-      }, 2000);
-    });
-  } catch (error) {
-    console.error(`[Docker] ❌ Failed to read directory ${containerPath}:`, error instanceof Error ? error.message : 'Unknown error');
-    throw error;
-  }
-}
-
-/**
- * Read file content from Docker container
- */
-/**
- * Demultiplex Docker stream data
- * Docker uses 8-byte headers for multiplexed streams:
- * - Byte 0: stream type (0=stdin, 1=stdout, 2=stderr)
- * - Bytes 1-3: reserved (0)
- * - Bytes 4-7: size of payload (big-endian uint32)
- */
-function demuxDockerStream(chunk: Buffer): string {
-  let result = '';
-  let offset = 0;
-
-  while (offset < chunk.length) {
-    // Check if we have enough bytes for header
-    if (offset + 8 > chunk.length) {
-      // Not enough data for header, treat as raw data (shouldn't happen, but safe fallback)
-      break;
-    }
-
-    // Read header
-    const streamType = chunk.readUInt8(offset);
-    const size = chunk.readUInt32BE(offset + 4);
-
-    // Validate header - stream type should be 0, 1, or 2
-    if (streamType > 2 || size > chunk.length - offset - 8) {
-      // Invalid header, treat remaining as raw string data
-      const rawData = chunk.slice(offset).toString('utf-8');
-      result += rawData;
-      break;
-    }
-
-    // Only extract stdout (streamType === 1) payload
-    if (streamType === 1) {
-      const payload = chunk.slice(offset + 8, offset + 8 + size).toString('utf-8');
-      result += payload;
-    }
-
-    offset += 8 + size;
-  }
-
-  return result;
-}
-
-export async function readContainerFile(containerPath: string): Promise<string> {
-  try {
-    const container = await getContainer();
-    if (!container) {
-      throw new Error('Container not found');
-    }
-
-    const info = await container.inspect();
-    if (!info.State.Running) {
-      throw new Error('Container not running');
-    }
-
-    // Use cat to read file content
-    const exec = await container.exec({
-      Cmd: ['sh', '-c', `cat "${containerPath}" 2>/dev/null || echo ""`],
-      AttachStdout: true,
-      AttachStderr: true,
-    });
-
-    const stream = await exec.start({});
-    let output = '';
-
-    return new Promise((resolve, reject) => {
-      stream.on('data', (chunk: Buffer) => {
-        // Properly demux Docker stream to extract actual data
-        try {
-          const demuxed = demuxDockerStream(chunk);
-          output += demuxed;
-        } catch {
-          // Fallback: if demuxing fails, try direct conversion (may have issues)
-          const data = chunk.toString('utf8');
-          output += data;
-        }
-      });
-
-      stream.on('end', () => {
-        // Remove control characters (0x00-0x1F) except newline (0x0A), carriage return (0x0D), and tab (0x09)
-        let cleanOutput = output.replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F]/g, '');
-        
-        // Remove BOM (Byte Order Mark) - U+FEFF, only at the start
-        if (cleanOutput.length > 0 && cleanOutput.charCodeAt(0) === 0xFEFF) {
-          cleanOutput = cleanOutput.substring(1);
-        }
-        
-        // Remove other problematic Unicode characters (zero-width characters, invisible formatting)
-        cleanOutput = cleanOutput.replace(/[\u200B-\u200D\u00AD]/g, '');
-        
-        resolve(cleanOutput);
-      });
-
-      stream.on('error', (err: Error) => {
-        reject(err);
-      });
-
-      setTimeout(() => {
-        // Remove control characters (0x00-0x1F) except newline (0x0A), carriage return (0x0D), and tab (0x09)
-        let cleanOutput = output.replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F]/g, '');
-        
-        // Remove BOM (Byte Order Mark) - U+FEFF, only at the start
-        if (cleanOutput.length > 0 && cleanOutput.charCodeAt(0) === 0xFEFF) {
-          cleanOutput = cleanOutput.substring(1);
-        }
-        
-        // Remove other problematic Unicode characters (zero-width characters, invisible formatting)
-        cleanOutput = cleanOutput.replace(/[\u200B-\u200D\u00AD]/g, '');
-        
-        resolve(cleanOutput);
-      }, 5000);
-    });
-  } catch (error) {
-    throw error;
-  }
-}
-
-/**
- * Write file content to Docker container
- */
-export async function writeContainerFile(containerPath: string, content: string): Promise<void> {
-  try {
-    const container = await getContainer();
-    if (!container) {
-      throw new Error('Container not found');
-    }
-
-    const info = await container.inspect();
-    if (!info.State.Running) {
-      throw new Error('Container not running');
-    }
-
-    // Escape content for shell and write using echo/printf
-    const escapedContent = content.replace(/'/g, "'\\''");
-    
-    // Use printf to write file (more reliable than echo for binary/special chars)
-    const exec = await container.exec({
-      Cmd: ['sh', '-c', `printf '%s' '${escapedContent}' > "${containerPath}"`],
-      AttachStdout: true,
-      AttachStderr: true,
-    });
-
-    const stream = await exec.start({});
-    let errorOutput = '';
-
-    return new Promise((resolve, reject) => {
-      stream.on('data', (chunk: Buffer) => {
-        const data = chunk.toString('utf8');
-        errorOutput += data;
-      });
-
-      stream.on('end', () => {
-        if (errorOutput.trim()) {
-          console.warn(`[Docker] ⚠️  Write file stderr: ${errorOutput}`);
-        }
-        resolve();
-      });
-
-      stream.on('error', (err: Error) => {
-        reject(err);
-      });
-
-      setTimeout(() => {
-        if (errorOutput.trim()) {
-          console.warn(`[Docker] ⚠️  Write file stderr: ${errorOutput}`);
-        }
-        resolve();
-      }, 3000);
-    });
-  } catch (error) {
-    console.error(`[Docker] ❌ Failed to write file ${containerPath}:`, error instanceof Error ? error.message : 'Unknown error');
-    throw error;
-  }
-}
-
-/**
- * Copy a file from local filesystem to Docker container
- * Uses base64 encoding to transfer binary files via exec
- */
-export async function copyFileToContainer(localFilePath: string, containerPath: string): Promise<void> {
-  console.log(`[Docker] 📤 copyFileToContainer called`);
-  console.log(`[Docker]   Local file: ${localFilePath}`);
-  console.log(`[Docker]   Container path: ${containerPath}`);
-  
-  try {
-    // Verify local file exists
-    if (!fs.existsSync(localFilePath)) {
-      throw new Error(`Local file does not exist: ${localFilePath}`);
-    }
-    const localStats = fs.statSync(localFilePath);
-    console.log(`[Docker]   Local file size: ${localStats.size} bytes`);
-
-    const container = await getContainer();
-    if (!container) {
-      throw new Error('Container not found');
-    }
-    console.log(`[Docker] ✅ Container found: ${config.gameContainerName}`);
-
-    const info = await container.inspect();
-    if (!info.State.Running) {
-      throw new Error('Container not running');
-    }
-    console.log(`[Docker] ✅ Container is running`);
-
-    // Read the file as a buffer and encode to base64
-    console.log(`[Docker] 📖 Reading file and encoding to base64...`);
-    const fileBuffer = fs.readFileSync(localFilePath);
-    const base64Content = fileBuffer.toString('base64');
-    console.log(`[Docker]   Base64 length: ${base64Content.length} characters`);
-
-    // Normalize path to use forward slashes (Linux container paths)
-    // path.join() on Windows creates backslashes, but containers need forward slashes
-    const normalizedPath = containerPath.replace(/\\/g, '/');
-    const containerDir = path.posix.dirname(normalizedPath);
-    const fileName = path.posix.basename(normalizedPath);
-    console.log(`[Docker]   Normalized container path: ${normalizedPath}`);
-    console.log(`[Docker]   Container directory: ${containerDir}`);
-    console.log(`[Docker]   File name: ${fileName}`);
-
-    // Ensure directory exists in container
-    console.log(`[Docker] 📁 Ensuring directory exists in container...`);
-    const mkdirExec = await container.exec({
-      Cmd: ['sh', '-c', `mkdir -p "${containerDir}"`],
-      AttachStdout: true,
-      AttachStderr: true,
-    });
-    const mkdirStream = await mkdirExec.start({});
-    let mkdirOutput = '';
-    mkdirStream.on('data', (chunk: Buffer) => {
-      mkdirOutput += chunk.toString('utf8');
-    });
-    await new Promise<void>((resolve) => {
-      mkdirStream.on('end', resolve);
-      setTimeout(() => resolve(), 2000);
-    });
-    if (mkdirOutput) {
-      console.log(`[Docker]   mkdir output: ${mkdirOutput}`);
-    }
-    console.log(`[Docker] ✅ Directory ensured`);
-
-    // Write file using base64 decode
-    const tempFile = `/tmp/upload_${Date.now()}_${Math.random().toString(36).substring(7)}.b64`;
-    const uniqueDelimiter = `EOF_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-    console.log(`[Docker] 📝 Writing base64 to temp file: ${tempFile}`);
-    
-    // Write base64 content to temp file in container using heredoc with unique delimiter
-    // Use a unique delimiter to avoid conflicts with base64 content
-    // Construct the heredoc command with actual newlines (not \n escape sequences)
-    const heredocCommand = `cat > "${tempFile}" << '${uniqueDelimiter}'
-${base64Content}
-${uniqueDelimiter}`;
-    const writeExec = await container.exec({
-      Cmd: ['sh', '-c', heredocCommand],
-      AttachStdout: true,
-      AttachStderr: true,
-    });
-
-    const writeStream = await writeExec.start({});
-    let writeOutput = '';
-    let writeError = '';
-    
-    await new Promise<void>((resolve, reject) => {
-      writeStream.on('data', (chunk: Buffer) => {
-        const data = chunk.toString('utf8');
-        writeOutput += data;
-        if (data.toLowerCase().includes('error')) {
-          writeError += data;
-        }
-      });
-      writeStream.on('end', resolve);
-      writeStream.on('error', reject);
-      setTimeout(() => resolve(), 10000);
-    });
-
-    if (writeOutput) {
-      console.log(`[Docker]   Write output: ${writeOutput.substring(0, 200)}`);
-    }
-    if (writeError) {
-      console.warn(`[Docker] ⚠️  Write stderr: ${writeError}`);
-    }
-    console.log(`[Docker] ✅ Base64 written to temp file`);
-
-    // Verify temp file was created
-    console.log(`[Docker] 🔍 Verifying temp file exists...`);
-    const verifyTempExec = await container.exec({
-      Cmd: ['sh', '-c', `test -f "${tempFile}" && echo "EXISTS" || echo "NOT_FOUND"`],
-      AttachStdout: true,
-      AttachStderr: true,
-    });
-    const verifyTempStream = await verifyTempExec.start({});
-    let verifyTempOutput = '';
-    verifyTempStream.on('data', (chunk: Buffer) => {
-      verifyTempOutput += chunk.toString('utf8');
-    });
-    await new Promise<void>((resolve) => {
-      verifyTempStream.on('end', resolve);
-      setTimeout(() => resolve(), 2000);
-    });
-    console.log(`[Docker]   Temp file check: ${verifyTempOutput.trim()}`);
-
-    // Decode base64 and write to final location
-    console.log(`[Docker] 🔓 Decoding base64 and writing to final location...`);
-    const decodeExec = await container.exec({
-      Cmd: ['sh', '-c', `base64 -d "${tempFile}" > "${normalizedPath}" && rm -f "${tempFile}" && echo "SUCCESS"`],
-      AttachStdout: true,
-      AttachStderr: true,
-    });
-
-    const decodeStream = await decodeExec.start({});
-    let decodeOutput = '';
-    let decodeError = '';
-
-    await new Promise<void>((resolve, reject) => {
-      decodeStream.on('data', (chunk: Buffer) => {
-        const data = chunk.toString('utf8');
-        decodeOutput += data;
-        if (data.toLowerCase().includes('error') && !data.includes('base64: invalid input')) {
-          decodeError += data;
-        }
-      });
-      decodeStream.on('end', resolve);
-      decodeStream.on('error', reject);
-      setTimeout(() => resolve(), 15000);
-    });
-
-    if (decodeOutput) {
-      console.log(`[Docker]   Decode output: ${decodeOutput.trim()}`);
-    }
-    if (decodeError) {
-      console.warn(`[Docker] ⚠️  Decode stderr: ${decodeError}`);
-    }
-
-    // Verify final file exists
-    console.log(`[Docker] 🔍 Verifying final file exists...`);
-    const verifyFinalExec = await container.exec({
-      Cmd: ['sh', '-c', `test -f "${normalizedPath}" && stat -c "%s" "${normalizedPath}" || echo "NOT_FOUND"`],
-      AttachStdout: true,
-      AttachStderr: true,
-    });
-    const verifyFinalStream = await verifyFinalExec.start({});
-    let verifyFinalOutput = '';
-    verifyFinalStream.on('data', (chunk: Buffer) => {
-      verifyFinalOutput += chunk.toString('utf8');
-    });
-    await new Promise<void>((resolve) => {
-      verifyFinalStream.on('end', resolve);
-      setTimeout(() => resolve(), 2000);
-    });
-    const finalFileSize = verifyFinalOutput.trim();
-    if (finalFileSize && finalFileSize !== 'NOT_FOUND') {
-      console.log(`[Docker] ✅ File verified in container: ${normalizedPath} (${finalFileSize} bytes)`);
-      if (parseInt(finalFileSize) !== localStats.size) {
-        console.warn(`[Docker] ⚠️  File size mismatch! Local: ${localStats.size}, Container: ${finalFileSize}`);
-      }
-    } else {
-      console.error(`[Docker] ❌ File NOT found in container after copy: ${normalizedPath}`);
-    }
-
-    console.log(`[Docker] ✅ Copy operation completed`);
-  } catch (error) {
-    console.error(`[Docker] ❌ Failed to copy file to container ${containerPath}:`, error instanceof Error ? error.message : 'Unknown error');
-    throw error;
-  }
-}
-
-/**
- * Get file stats from Docker container
- */
-export async function getContainerFileStats(containerPath: string): Promise<{ size: number; modified: Date } | null> {
-  try {
-    const container = await getContainer();
-    if (!container) {
-      throw new Error('Container not found');
-    }
-
-    const info = await container.inspect();
-    if (!info.State.Running) {
-      throw new Error('Container not running');
-    }
-
-    // Execute stat command to get file info
-    const exec = await container.exec({
-      Cmd: ['sh', '-c', `stat -c "%s %Y" "${containerPath}" 2>/dev/null || echo ""`],
-      AttachStdout: true,
-      AttachStderr: true,
-    });
-
-    const stream = await exec.start({});
-    let output = '';
-
-    return new Promise((resolve, reject) => {
-      stream.on('data', (chunk: Buffer) => {
-        const data = chunk.toString('utf8');
-        output += data;
-      });
-
-      stream.on('end', () => {
-        // Clean up docker stream headers and control characters
-        // Docker streams can contain control characters like \x1D (Group Separator) in stream framing
-        // Remove all control characters (0x00-0x1F) except newline (0x0A), carriage return (0x0D), and tab (0x09)
-        const cleanOutput = output.replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F]/g, '').trim();
-        if (!cleanOutput) {
-          resolve(null);
-          return;
-        }
-
-        // Parse output: "size timestamp"
-        const parts = cleanOutput.split(' ');
-        if (parts.length >= 2) {
-          const size = parseInt(parts[0], 10);
-          const timestamp = parseInt(parts[1], 10);
-          resolve({
-            size: isNaN(size) ? 0 : size,
-            modified: new Date(timestamp * 1000), // Convert Unix timestamp to Date
-          });
-        } else {
-          resolve(null);
-        }
-      });
-
-      stream.on('error', (err: Error) => {
-        reject(err);
-      });
-
-      setTimeout(() => {
-        // Clean up docker stream headers and control characters
-        // Docker streams can contain control characters like \x1D (Group Separator) in stream framing
-        // Remove all control characters (0x00-0x1F) except newline (0x0A), carriage return (0x0D), and tab (0x09)
-        const cleanOutput = output.replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F]/g, '').trim();
-        if (!cleanOutput) {
-          resolve(null);
-          return;
-        }
-
-        const parts = cleanOutput.split(' ');
-        if (parts.length >= 2) {
-          const size = parseInt(parts[0], 10);
-          const timestamp = parseInt(parts[1], 10);
-          resolve({
-            size: isNaN(size) ? 0 : size,
-            modified: new Date(timestamp * 1000),
-          });
-        } else {
-          resolve(null);
-        }
-      }, 2000);
-    });
-  } catch (error) {
-    console.error(`[Docker] ❌ Failed to get file stats for ${containerPath}:`, error instanceof Error ? error.message : 'Unknown error');
-    return null;
-  }
 }
 
 export function getContainerName(): string {

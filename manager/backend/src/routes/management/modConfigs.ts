@@ -37,14 +37,11 @@ router.get('/mods/:filename/configs', authMiddleware, requirePermission('mods.vi
       path.posix.join(config.hytaleContainerModsPath, 'config', baseModName),
       path.posix.join(config.hytaleContainerServerPath, 'config', modName),
       path.posix.join(config.hytaleContainerServerPath, 'config', baseModName),
-      path.posix.join(config.hytaleContainerDataPath, 'config', modName),
-      path.posix.join(config.hytaleContainerDataPath, 'config', baseModName),
     );
 
     // 3. Also search in server/config and data/config for fuzzy matches
     const serverConfigMatches = await findConfigDirs(path.posix.join(config.hytaleContainerServerPath, 'config'), baseModName);
-    const dataConfigMatches = await findConfigDirs(path.posix.join(config.hytaleContainerDataPath, 'config'), baseModName);
-    configPaths.push(...serverConfigMatches, ...dataConfigMatches);
+    configPaths.push(...serverConfigMatches);
 
     // Deduplicate paths
     const uniquePaths = [...new Set(configPaths)];
@@ -52,13 +49,11 @@ router.get('/mods/:filename/configs', authMiddleware, requirePermission('mods.vi
     const configs: { name: string; path: string }[] = [];
 
     // Helper to determine basePath from config path
-    const getBasePath = (configPath: string): 'mods' | 'server' | 'data' => {
+    const getBasePath = (configPath: string): 'mods' | 'server' => {
       if (configPath.startsWith(config.hytaleContainerModsPath)) {
         return 'mods';
       } else if (configPath.startsWith(config.hytaleContainerServerPath)) {
         return 'server';
-      } else if (configPath.startsWith(config.hytaleContainerDataPath)) {
-        return 'data';
       }
       return 'mods'; // default
     };
@@ -103,7 +98,7 @@ router.get('/config/read', authMiddleware, requirePermission('config.view'), asy
     }
 
     // SECURITY: Use proper path validation to prevent traversal attacks
-    const allowedDirectories = [config.hytaleContainerModsPath, config.hytaleContainerModsPath, config.hytaleContainerServerPath, config.hytaleContainerDataPath];
+    const allowedDirectories = [config.hytaleContainerModsPath, config.hytaleContainerModsPath, config.hytaleContainerServerPath];
     const safePath = getRealPathIfSafe(configPath, allowedDirectories);
 
     if (!safePath) {
@@ -129,7 +124,7 @@ router.put('/config/write', authMiddleware, requirePermission('config.edit'), as
     }
 
     // SECURITY: Use proper path validation to prevent traversal attacks
-    const allowedDirectories = [config.hytaleContainerModsPath, config.hytaleContainerModsPath, config.hytaleContainerServerPath, config.hytaleContainerDataPath];
+    const allowedDirectories = [config.hytaleContainerModsPath, config.hytaleContainerModsPath, config.hytaleContainerServerPath];
     const safePath = getRealPathIfSafe(configPath, allowedDirectories);
 
     if (!safePath) {

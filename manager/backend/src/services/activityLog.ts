@@ -1,5 +1,6 @@
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import path from 'path';
+import { config } from '../config.js';
 
 // Activity log entry
 export interface ActivityLogEntry {
@@ -17,25 +18,8 @@ export interface ActivityLogEntry {
 const activityLog: ActivityLogEntry[] = [];
 const MAX_LOG_ENTRIES = 500;
 
-// Path to persistent log file
-// Manager-specific files path:
-//   - If HOST_DATA_PATH env var is set: use it (override)
-//   - If running locally: use HOST_DATA_PATH/manager
-//   - If running in Docker: default to /app/data
-function getManagerDataPath(): string {
-  if (process.env.HOST_DATA_PATH) {
-    return process.env.HOST_DATA_PATH;
-  }
-  const fs = require('fs');
-  const isInDocker = fs.existsSync('/.dockerenv') || !!process.env.DOCKER_CONTAINER;
-  if (!isInDocker) {
-    const hostDataPath = process.env.HOST_DATA_PATH || '/opt/hytale';
-    return path.join(hostDataPath, 'manager');
-  }
-  return '/app/data';
-}
-
-const DATA_DIR = getManagerDataPath();
+// Path to persistent log file (manager data path from config)
+const DATA_DIR = config.managerDataPath;
 const LOG_FILE = path.join(DATA_DIR, 'activity-log.json');
 
 // Generate unique ID

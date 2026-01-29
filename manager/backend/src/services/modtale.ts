@@ -129,7 +129,7 @@ interface InstalledModsData {
 const INSTALLED_MODS_FILE = 'modtale-installed.json';
 
 function getInstalledModsPath(): string {
-  return path.join(config.hytaleContainerDataPath, INSTALLED_MODS_FILE);
+  return path.join(config.hytaleContainerServerPath, INSTALLED_MODS_FILE);
 }
 
 async function loadInstalledMods(): Promise<InstalledModsData> {
@@ -145,7 +145,7 @@ async function loadInstalledMods(): Promise<InstalledModsData> {
 async function saveInstalledMods(data: InstalledModsData): Promise<void> {
   try {
     const filePath = getInstalledModsPath();
-    // Ensure data directory exists
+    // Ensure server directory exists
     await mkdir(path.dirname(filePath), { recursive: true });
     await writeFile(filePath, JSON.stringify(data, null, 2));
   } catch (e) {
@@ -605,7 +605,7 @@ export async function installModFromModtale(
     case 'DATA':
     case 'ART':
     case 'SAVE':
-      targetPath = config.hytaleContainerDataPath;
+      targetPath = config.hytaleContainerServerPath;
       break;
     case 'MODPACK':
       targetPath = config.hytaleContainerModsPath;
@@ -735,7 +735,7 @@ export async function uninstallModtale(projectId: string): Promise<{ success: bo
     case 'DATA':
     case 'ART':
     case 'SAVE':
-      basePath = config.hytaleContainerDataPath;
+      basePath = config.hytaleContainerServerPath;
       break;
     case 'MODPACK':
     default:

@@ -1,12 +1,177 @@
 import fs from 'fs';
 import path from 'path';
-import { execSync } from 'child_process';
+import zlib from 'zlib';
+import archiver from 'archiver';
+import unzipper from 'unzipper';
+import { pipeline } from 'stream/promises';
 import { config } from '../config.js';
 import type { BackupInfo, StorageInfo, ActionResponse } from '../types/index.js';
 import { isValidBackupName } from '../utils/sanitize.js';
 import { isPathSafe } from '../utils/pathSecurity.js';
 import { readServerDir, getServerFileStats } from '../utils/fileAccess.js';
-import * as dockerService from './docker.js';
+import * as tarStream from 'tar-stream';
+
+/** Effective backups directory for direct fs access (shared volume in dev/prod). */
+function getBackupsDir(): string {
+  return config.effectiveBackupsPath ?? path.join(config.gameDataPath, 'backups');
+}
+
+/** Paths relative to game data root to exclude from backups (files and folders). */
+const BACKUP_EXCLUDED_RELATIVE_PATHS: string[] = [
+  'Assets.zip',
+  'assets',
+  'backups',
+];
+
+function isExcludedFromBackup(rel: string, excludedRelative: string[]): boolean {
+  const normalized = rel.replace(/\\/g, '/');
+  for (const ex of excludedRelative) {
+    const exNorm = ex.replace(/\\/g, '/');
+    if (normalized === exNorm || normalized.startsWith(exNorm + '/')) return true;
+  }
+  return false;
+}
+
+/** Recursively add directory contents to a tar pack (excludes excludePath and excludedRelative). */
+async function addDirToPack(
+  pack: ReturnType<typeof tarStream.pack>,
+  dirPath: string,
+  basePath: string,
+  excludePath: string,
+  excludedRelative: string[] = []
+): Promise<void> {
+  const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
+  for (const e of entries) {
+    const full = path.join(dirPath, e.name);
+    if (path.resolve(full) === path.resolve(excludePath)) continue;
+    const rel = path.relative(basePath, full).replace(/\\/g, '/');
+    if (isExcludedFromBackup(rel, excludedRelative)) continue;
+    if (e.isDirectory()) {
+      pack.entry({ name: rel + '/', type: 'directory' });
+      await addDirToPack(pack, full, basePath, excludePath, excludedRelative);
+    } else {
+      const buf = await fs.promises.readFile(full);
+      pack.entry({ name: rel, size: buf.length, type: 'file' }, buf);
+    }
+  }
+}
+
+/** Create a .tar.gz archive of a directory (pure Node, no system tar). */
+async function createTarGzFromDir(
+  sourceDir: string,
+  archivePath: string,
+  excludedRelative: string[] = []
+): Promise<void> {
+  const pack = tarStream.pack();
+  const gzip = zlib.createGzip();
+  const out = fs.createWriteStream(archivePath);
+  pack.pipe(gzip).pipe(out);
+
+  await addDirToPack(pack, sourceDir, sourceDir, archivePath, excludedRelative);
+  pack.finalize();
+
+  await new Promise<void>((resolve, reject) => {
+    out.once('finish', () => resolve());
+    out.once('error', reject);
+    pack.once('error', reject);
+    gzip.once('error', reject);
+  });
+}
+
+/** Extract a .tar.gz archive to a directory (pure Node, no system tar). */
+async function extractTarGzToDir(archivePath: string, destDir: string): Promise<void> {
+  const extract = tarStream.extract();
+  const destResolved = path.resolve(destDir);
+
+  await new Promise<void>((resolve, reject) => {
+    extract.on('entry', (header, stream, next) => {
+      const name = header.name.replace(/\\/g, '/').replace(/\/$/, '');
+      const dest = path.join(destDir, name);
+      const resolved = path.resolve(dest);
+      if (resolved !== destResolved && !resolved.startsWith(destResolved + path.sep)) {
+        stream.resume();
+        next();
+        return;
+      }
+      if (header.type === 'directory' || name === '' || header.name.endsWith('/')) {
+        fs.mkdirSync(dest, { recursive: true });
+        stream.on('end', next);
+        stream.resume();
+        return;
+      }
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      const w = fs.createWriteStream(dest);
+      stream.pipe(w);
+      w.on('finish', next);
+      w.on('error', (err) => {
+        stream.destroy();
+        next(err);
+      });
+    });
+    extract.on('finish', resolve);
+    extract.on('error', reject);
+
+    fs.createReadStream(archivePath)
+      .pipe(zlib.createGunzip())
+      .pipe(extract);
+  });
+}
+
+/** Create a .zip archive of a directory; contents at root. Excludes excludePath and excludedRelative. */
+async function createZipFromDir(
+  sourceDir: string,
+  archivePath: string,
+  excludedRelative: string[] = []
+): Promise<void> {
+  const output = fs.createWriteStream(archivePath);
+  const archive = archiver('zip', { zlib: { level: 9 } });
+
+  await new Promise<void>((resolve, reject) => {
+    output.on('close', () => resolve());
+    output.on('error', reject);
+    archive.on('error', reject);
+
+    archive.pipe(output);
+
+    const entries = fs.readdirSync(sourceDir, { withFileTypes: true });
+    for (const e of entries) {
+      const full = path.join(sourceDir, e.name);
+      if (path.resolve(full) === path.resolve(archivePath)) continue;
+      const rel = path.relative(sourceDir, full).replace(/\\/g, '/');
+      if (isExcludedFromBackup(rel, excludedRelative)) continue;
+      if (e.isDirectory()) {
+        archive.directory(full + path.sep, e.name);
+      } else {
+        archive.file(full, { name: e.name });
+      }
+    }
+
+    archive.finalize();
+  });
+}
+
+/** Extract a .zip archive to a directory (entries at root). */
+async function extractZipToDir(archivePath: string, destDir: string): Promise<void> {
+  const destResolved = path.resolve(destDir);
+  const directory = await unzipper.Open.file(archivePath);
+
+  for (const entry of directory.files) {
+    const name = entry.path.replace(/\\/g, '/').replace(/\/$/, '');
+    if (!name) continue;
+    const dest = path.join(destDir, name);
+    const resolved = path.resolve(dest);
+    if (resolved !== destResolved && !resolved.startsWith(destResolved + path.sep)) continue;
+
+    if (entry.type === 'Directory') {
+      fs.mkdirSync(dest, { recursive: true });
+    } else {
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      const readStream = entry.stream();
+      const writeStream = fs.createWriteStream(dest, { flags: 'w' });
+      await pipeline(readStream, writeStream);
+    }
+  }
+}
 
 // SECURITY: Validate backup ID to prevent path traversal
 function validateBackupId(backupId: string): boolean {
@@ -18,12 +183,16 @@ function validateBackupId(backupId: string): boolean {
 
 export async function listBackups(): Promise<BackupInfo[]> {
   const backups: BackupInfo[] = [];
+  const listPath = config.hytaleContainerBackupsPath;
+  console.log('[Backup] listBackups: reading directory', listPath);
 
   // Check if directory exists by trying to read it
   let files: string[] = [];
   try {
-    files = await readServerDir(config.hytaleContainerBackupsPath, 'backups');
-  } catch {
+    files = await readServerDir(listPath, 'backups');
+    console.log('[Backup] listBackups: directory read ok, files count:', files.length, 'entries:', files.slice(0, 20).join(', ') + (files.length > 20 ? '...' : ''));
+  } catch (err) {
+    console.warn('[Backup] listBackups: failed to read directory', listPath, err);
     return backups;
   }
 
@@ -96,13 +265,14 @@ export function getBackupPath(backupId: string): string | null {
     return null;
   }
 
-  const extensions = ['.tar.gz', '.tar', '.zip'];
+  const backupsDir = getBackupsDir();
+  const extensions = ['.zip', '.tar.gz', '.tar'];
 
   for (const ext of extensions) {
-    const filePath = path.join(config.hytaleContainerBackupsPath, `${backupId}${ext}`);
+    const filePath = path.join(backupsDir, `${backupId}${ext}`);
 
     // SECURITY: Verify path is within backups directory
-    if (!isPathSafe(filePath, [config.hytaleContainerBackupsPath])) {
+    if (!isPathSafe(filePath, [backupsDir])) {
       return null;
     }
 
@@ -123,52 +293,34 @@ export async function createBackup(name?: string): Promise<ActionResponse & { ba
   // Generate backup name
   const timestamp = new Date().toISOString().replace(/[:.]/g, '').replace('T', '_').substring(0, 15);
   const backupName = name ? `manual_${name}_${timestamp}` : `manual_${timestamp}`;
-  const backupFile = path.posix.join(config.hytaleContainerBackupsPath, `${backupName}.tar.gz`);
+  const backupsDir = getBackupsDir();
+  const backupFile = path.join(backupsDir, `${backupName}.zip`);
+
+  console.log('[Backup] createBackup: backups directory path:', backupsDir);
+  console.log('[Backup] createBackup: backup file path:', backupFile);
 
   // SECURITY: Double-check path is safe
-  if (!isPathSafe(backupFile, [config.hytaleContainerBackupsPath])) {
+  if (!isPathSafe(backupFile, [backupsDir])) {
     return { success: false, error: 'Invalid backup path' };
   }
 
   try {
-    // Ensure backups directory exists inside the container
-    const mkdirResult = await dockerService.execInGameServerContainer(
-      `mkdir -p '${config.hytaleContainerBackupsPath}'`
-    );
-    if (!mkdirResult.success) {
-      console.warn(`[Backup] Failed to create backups directory: ${mkdirResult.error}`);
-    }
+    // Ensure backups directory exists (direct fs on shared volume)
+    await fs.promises.mkdir(backupsDir, { recursive: true });
 
-    // Create tarball using tar command inside the container
-    // Use posix paths for container paths
-    const dataPath = config.hytaleContainerDataPath;
-    const tarCommand = `tar -czf '${backupFile}' -C '${dataPath}' .`;
-    
+    // Create zip of full game data (folders/files at root); exclude archive + BACKUP_EXCLUDED_RELATIVE_PATHS
     console.log(`[Backup] Creating backup: ${backupName}`);
-    console.log(`[Backup] Command: tar -czf '${backupFile}' -C '${dataPath}' .`);
-    
-    const result = await dockerService.execInGameServerContainer(tarCommand);
-    
-    if (!result.success) {
-      return { success: false, error: result.error || 'Backup command failed' };
-    }
+    await createZipFromDir(config.gameDataPath, backupFile, BACKUP_EXCLUDED_RELATIVE_PATHS);
 
-    // Get file stats from inside the container
-    const statCommand = `stat -c '%s' '${backupFile}' 2>/dev/null || stat -f '%z' '${backupFile}' 2>/dev/null || echo '0'`;
-    const statResult = await dockerService.execInGameServerContainer(statCommand);
-    
-    if (!statResult.success || !statResult.output) {
-      return { success: false, error: 'Failed to get backup file size' };
-    }
-
-    const sizeBytes = parseInt(statResult.output.trim(), 10) || 0;
+    const stat = await fs.promises.stat(backupFile);
+    const sizeBytes = stat.size;
     const sizeMb = sizeBytes > 0 ? Math.max(0.01, Math.round(sizeBytes / (1024 * 1024) * 100) / 100) : 0;
 
     return {
       success: true,
       backup: {
         id: backupName,
-        filename: `${backupName}.tar.gz`,
+        filename: `${backupName}.zip`,
         size_bytes: sizeBytes,
         size_mb: sizeMb,
         created_at: new Date().toISOString(),
@@ -193,7 +345,7 @@ export function deleteBackup(backupId: string): ActionResponse {
   }
 
   // SECURITY: Verify path is safe before deletion
-  if (!isPathSafe(filePath, [config.hytaleContainerBackupsPath])) {
+  if (!isPathSafe(filePath, [getBackupsDir()])) {
     return { success: false, error: 'Invalid backup path' };
   }
 
@@ -205,88 +357,73 @@ export function deleteBackup(backupId: string): ActionResponse {
   }
 }
 
+/** Move contents of srcDir into destDir (direct fs). destDir must exist. */
+function moveDirContents(srcDir: string, destDir: string): void {
+  const entries = fs.readdirSync(srcDir, { withFileTypes: true });
+  for (const entry of entries) {
+    const srcPath = path.join(srcDir, entry.name);
+    const destPath = path.join(destDir, entry.name);
+    if (entry.isDirectory()) {
+      fs.mkdirSync(destPath, { recursive: true });
+      moveDirContents(srcPath, destPath);
+      fs.rmdirSync(srcPath);
+    } else {
+      fs.renameSync(srcPath, destPath);
+    }
+  }
+}
+
 export async function restoreBackup(backupId: string): Promise<ActionResponse> {
   // SECURITY: Validate backup ID first
   if (!validateBackupId(backupId)) {
     return { success: false, error: 'Invalid backup ID' };
   }
 
-  // Get backup file path inside the container
-  // Try different extensions to find the backup file
-  const extensions = ['.tar.gz', '.tar', '.zip'];
-  let backupFile: string | null = null;
-  
-  for (const ext of extensions) {
-    const testPath = path.posix.join(config.hytaleContainerBackupsPath, `${backupId}${ext}`);
-    
-    // SECURITY: Verify path is safe
-    if (!isPathSafe(testPath, [config.hytaleContainerBackupsPath])) {
-      continue;
-    }
-    
-    // Check if file exists in container
-    const checkResult = await dockerService.execInGameServerContainer(
-      `test -f '${testPath}' && echo 'EXISTS' || echo 'NOT_FOUND'`
-    );
-    
-    if (checkResult.success && checkResult.output?.trim() === 'EXISTS') {
-      backupFile = testPath;
-      break;
-    }
-  }
-
+  const backupFile = getBackupPath(backupId);
   if (!backupFile) {
     return { success: false, error: 'Backup not found' };
   }
+
+  const tempDir = path.join(config.gameDataPath, '_restore_temp');
 
   try {
     // Create a pre-restore backup
     await createBackup('pre_restore');
 
-    // Use posix paths for container operations
-    const tempDir = path.posix.join(config.hytaleContainerBackupsPath, '_restore_temp');
-    const dataPath = config.hytaleContainerDataPath;
-
     console.log(`[Backup] Starting restore from: ${backupFile}`);
     console.log(`[Backup] Temp directory: ${tempDir}`);
-    console.log(`[Backup] Data path: ${dataPath}`);
+    console.log(`[Backup] Game data path: ${config.gameDataPath}`);
 
-    // Remove temp directory if it exists, then create it
-    const cleanupResult = await dockerService.execInGameServerContainer(
-      `rm -rf '${tempDir}' && mkdir -p '${tempDir}'`
-    );
-    if (!cleanupResult.success) {
-      return { success: false, error: `Failed to create temp directory: ${cleanupResult.error}` };
-    }
+    // Create temp dir outside backups (so we don't delete it when clearing backups)
+    await fs.promises.mkdir(tempDir, { recursive: true });
 
-    // Extract backup inside the container
+    // Extract backup (full game data at root)
     console.log(`[Backup] Extracting backup...`);
-    const extractCommand = `tar -xzf '${backupFile}' -C '${tempDir}'`;
-    const extractResult = await dockerService.execInGameServerContainer(extractCommand);
-    
-    if (!extractResult.success) {
-      return { success: false, error: `Failed to extract backup: ${extractResult.error || 'Unknown error'}` };
+    if (backupFile.toLowerCase().endsWith('.zip')) {
+      await extractZipToDir(backupFile, tempDir);
+    } else {
+      await extractTarGzToDir(backupFile, tempDir);
     }
 
-    // Remove current data directory
-    console.log(`[Backup] Removing current data directory...`);
-    const removeResult = await dockerService.execInGameServerContainer(
-      `rm -rf '${dataPath}'`
-    );
-    if (!removeResult.success) {
-      console.warn(`[Backup] Warning: Failed to remove old data directory: ${removeResult.error}`);
-      // Continue anyway - mv will overwrite
+    // Replace game data root with extracted content
+    console.log(`[Backup] Replacing game data with restored content...`);
+    const gameDataPath = config.gameDataPath;
+    fs.mkdirSync(gameDataPath, { recursive: true });
+    const entries = fs.readdirSync(tempDir, { withFileTypes: true });
+    for (const entry of entries) {
+      const srcPath = path.join(tempDir, entry.name);
+      const destPath = path.join(gameDataPath, entry.name);
+      if (entry.isDirectory()) {
+        fs.rmSync(destPath, { recursive: true, force: true });
+        fs.renameSync(srcPath, destPath);
+      } else {
+        if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
+        fs.renameSync(srcPath, destPath);
+      }
     }
 
-    // Move temp directory to data path
-    console.log(`[Backup] Moving restored data to data directory...`);
-    const moveResult = await dockerService.execInGameServerContainer(
-      `mv '${tempDir}' '${dataPath}'`
-    );
-    
-    if (!moveResult.success) {
-      return { success: false, error: `Failed to move restored data: ${moveResult.error || 'Unknown error'}` };
-    }
+    // Remove temp dir
+    fs.rmSync(tempDir, { recursive: true, force: true });
 
     console.log(`[Backup] Restore completed successfully`);
 
@@ -295,6 +432,11 @@ export async function restoreBackup(backupId: string): Promise<ActionResponse> {
       message: `Restored from backup ${backupId}. Server restart required.`,
     };
   } catch (error) {
+    try {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
     return { success: false, error: error instanceof Error ? error.message : 'Restore failed' };
   }
 }

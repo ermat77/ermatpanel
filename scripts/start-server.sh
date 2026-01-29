@@ -47,7 +47,7 @@ SERVER_ARGS=(
 if [ "${ENABLE_BACKUP}" = "true" ]; then
     SERVER_ARGS+=(
         "--backup"
-        "--backup-dir" "/opt/hytale/backups"
+        "--backup-dir" "${GAME_DATA_PATH}/backups"
         "--backup-frequency" "${BACKUP_FREQUENCY}"
     )
 fi
@@ -58,7 +58,7 @@ if [ -n "${AUTH_MODE}" ]; then
 fi
 
 # Read panel config for additional settings
-PANEL_CONFIG="/opt/hytale/data/panel-config.json"
+PANEL_CONFIG="${MANAGER_DATA_PATH}/panel-config.json"
 
 # Function to read boolean value from panel config
 get_panel_config_bool() {

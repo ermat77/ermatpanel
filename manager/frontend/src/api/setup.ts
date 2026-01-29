@@ -168,6 +168,18 @@ export interface ProgressEvent {
   bytesPerSecond?: number
   estimatedSeconds?: number
   error?: string
+  /** Server download: streamed stdout lines (auth links, progress) */
+  stdoutLines?: string[]
+  /** Server download: OAuth/device-login URL for user to click and authenticate */
+  authUrl?: string
+  /** Server download: parsed progress (0–100) */
+  downloadPercent?: number
+  downloadMb?: number
+  downloadTotalGb?: number
+  status?: string
+  currentStep?: string
+  stepProgress?: number
+  overallProgress?: number
 }
 
 // Types for downloader authentication (separate from server auth)
@@ -464,10 +476,14 @@ export const setupApi = {
   },
 
   /**
-   * Start server download
+   * Start server download.
+   * Uses long timeout (30 min) because the download can take many minutes (or longer if user must authenticate).
+   * Progress is streamed via SSE; this request blocks until the backend finishes the full download.
    */
   async startServerDownload(): Promise<{ success: boolean; error?: string }> {
-    const response = await api.post<{ success: boolean; error?: string }>('/setup/server-download/start')
+    const response = await api.post<{ success: boolean; error?: string }>('/setup/server-download/start', undefined, {
+      timeout: 30 * 60 * 1000, // 30 minutes – download + extract can take a long time
+    })
     return response.data
   },
 
@@ -595,7 +611,7 @@ export function createProgressStream(
   onComplete: () => void,
   onError: (error: string) => void
 ): () => void {
-  const eventSource = new EventSource(`/api${url}`)
+  const eventSource = new EventSource(`/api${url}`, { withCredentials: true })
 
   eventSource.onmessage = (event) => {
     try {
@@ -648,13 +664,35 @@ export function subscribeToExtractionProgress(
   return createProgressStream('/setup/assets/progress', onProgress, onComplete, onError)
 }
 
-// Server download progress stream
+// Server download progress stream.
+// Returns { cleanup, ready }: call cleanup to close the stream; await ready before starting the download
+// so the SSE connection is established and the backend has registered the listener before POST /start runs.
 export function subscribeToServerDownloadProgress(
   onProgress: (event: ProgressEvent) => void,
   onComplete: () => void,
   onError: (error: string) => void
-): () => void {
-  return createProgressStream('/setup/server-download/progress', onProgress, onComplete, onError)
+): { cleanup: () => void; ready: Promise<void> } {
+  let readyResolve: () => void
+  let readySettled = false
+  const ready = new Promise<void>((resolve) => {
+    readyResolve = () => {
+      if (!readySettled) {
+        readySettled = true
+        resolve()
+      }
+    }
+  })
+  const cleanup = createProgressStream('/setup/server-download/progress', (event) => {
+    readyResolve()
+    onProgress(event)
+  }, onComplete, (err) => {
+    readyResolve()
+    onError(err)
+  })
+  return {
+    cleanup,
+    ready,
+  }
 }
 
 // Server console stream during setup

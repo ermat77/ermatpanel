@@ -3,8 +3,21 @@ import http from 'http';
 import { writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import path from 'path';
+import os from 'os';
 import { execSync } from 'child_process';
 import { config } from '../config.js';
+
+/**
+ * Binary name for the current platform (manager runs the downloader on its own host).
+ * Linux: hytale-downloader-linux-amd64, Windows: hytale-downloader-windows-amd64.exe
+ */
+function getDownloaderBinaryName(): string {
+  const platform = os.platform();
+  if (platform === 'win32') {
+    return 'hytale-downloader-windows-amd64.exe';
+  }
+  return 'hytale-downloader-linux-amd64';
+}
 
 /**
  * Progress callback type for download operations
@@ -71,31 +84,25 @@ async function downloadFile(url: string, destPath: string): Promise<boolean> {
 }
 
 /**
- * Get container path for downloader binary
- * Based on HOST_DATA_PATH, the downloader is mounted at the same relative path in container
- */
-function getHytaleDownloaderPath(): string {
-  // Get HOST_DATA_PATH from config
-  const hostDataPath = config.hostDataPath;
-  // Container path mirrors host path structure
-  // If HOST_DATA_PATH is /opt/hytale, container path is /opt/hytale/downloader
-  return path.join(hostDataPath, 'downloader');
-}
-
-/**
- * Check if hytale-downloader is already installed
- * Checks host path (where downloader is stored)
- * The host path is mounted in the container at the same path
+ * Check if hytale-downloader is already installed on the manager.
+ * Returns the host/manager path to the binary for spawning the process on the manager.
  */
 export async function isDownloaderInstalled(): Promise<{ installed: boolean; binaryPath?: string; error?: string }> {
   try {
-    // Check host path (where downloader is stored)
-    const hostBinaryPath = path.join(config.hostDownloaderPath, 'hytale-downloader-linux-amd64');
+    // Prefer current platform binary, then fall back to Linux (e.g. manager container is often Linux)
+    const binaryName = getDownloaderBinaryName();
+    const hostBinaryPath = path.join(config.hostDownloaderPath, binaryName);
     if (existsSync(hostBinaryPath)) {
-      // Return container path (same structure as host path)
-      const containerDownloaderPath = getHytaleDownloaderPath();
-      const containerBinaryPath = path.join(containerDownloaderPath, 'hytale-downloader-linux-amd64');
-      return { installed: true, binaryPath: containerBinaryPath };
+      return { installed: true, binaryPath: hostBinaryPath };
+    }
+    // Fallback: Linux binary (for manager running in Docker on Linux)
+    const linuxPath = path.join(config.hostDownloaderPath, 'hytale-downloader-linux-amd64');
+    if (existsSync(linuxPath)) {
+      return { installed: true, binaryPath: linuxPath };
+    }
+    const windowsPath = path.join(config.hostDownloaderPath, 'hytale-downloader-windows-amd64.exe');
+    if (existsSync(windowsPath)) {
+      return { installed: true, binaryPath: windowsPath };
     }
 
     return { installed: false };
@@ -189,29 +196,32 @@ export async function extractDownloader(
       return { success: false, error: `Failed to extract downloader: ${error instanceof Error ? error.message : 'Unknown error'}` };
     }
 
-    // Verify binary exists after extraction
-    const hostBinaryPath = path.join(extractDir, 'hytale-downloader-linux-amd64');
-    if (!existsSync(hostBinaryPath)) {
-      return { success: false, error: 'Binary not found after extraction' };
+    // Verify at least one binary exists after extraction (zip may contain both Linux and Windows)
+    const linuxPath = path.join(extractDir, 'hytale-downloader-linux-amd64');
+    const windowsPath = path.join(extractDir, 'hytale-downloader-windows-amd64.exe');
+    const hostBinaryPath = existsSync(linuxPath)
+      ? linuxPath
+      : existsSync(windowsPath)
+        ? windowsPath
+        : null;
+    if (!hostBinaryPath) {
+      return { success: false, error: 'Binary not found after extraction (expected hytale-downloader-linux-amd64 or hytale-downloader-windows-amd64.exe)' };
     }
 
-    // Make binary executable on host
-    onProgress?.({
-      step: 'extracting-downloader',
-      stepProgress: 80,
-      overallProgress: 90,
-      message: 'Making binary executable...',
-    });
-
-    try {
-      execSync(`chmod +x "${hostBinaryPath}"`, { stdio: 'pipe' });
-    } catch (error) {
-      console.warn('[HytaleDownloader] Failed to make binary executable on host, continuing anyway');
+    // Make binary executable on host (Linux/macOS only; no-op on Windows)
+    if (os.platform() !== 'win32') {
+      onProgress?.({
+        step: 'extracting-downloader',
+        stepProgress: 80,
+        overallProgress: 90,
+        message: 'Making binary executable...',
+      });
+      try {
+        execSync(`chmod +x "${hostBinaryPath}"`, { stdio: 'pipe' });
+      } catch (error) {
+        console.warn('[HytaleDownloader] Failed to make binary executable on host, continuing anyway');
+      }
     }
-
-    // Return container path for execution (host path is mounted in container)
-    const containerDownloaderPath = getHytaleDownloaderPath();
-    const containerBinaryPath = path.join(containerDownloaderPath, 'hytale-downloader-linux-amd64');
 
     onProgress?.({
       step: 'extracting-downloader',
@@ -220,7 +230,7 @@ export async function extractDownloader(
       message: 'Extracted downloader and made binary executable',
     });
 
-    return { success: true, binaryPath: containerBinaryPath };
+    return { success: true, binaryPath: hostBinaryPath };
   } catch (error) {
     return {
       success: false,
@@ -238,6 +248,9 @@ export async function installDownloader(
 ): Promise<{ success: boolean; binaryPath?: string; error?: string }> {
   try {
     console.log('[HytaleDownloader] Starting downloader installation...');
+
+    // Ensure manager downloader directory exists
+    await mkdir(config.hostDownloaderPath, { recursive: true });
 
     // Check if already installed
     const installed = await isDownloaderInstalled();

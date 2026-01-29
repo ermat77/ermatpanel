@@ -24,20 +24,7 @@ interface UsersData {
   users: User[];
 }
 
-function getManagerDataPath(): string {
-  if (process.env.HOST_DATA_PATH) {
-    return process.env.HOST_DATA_PATH;
-  }
-  const fs = require('fs');
-  const isInDocker = fs.existsSync('/.dockerenv') || !!process.env.DOCKER_CONTAINER;
-  if (!isInDocker) {
-    const hostDataPath = process.env.HOST_DATA_PATH || '/opt/hytale';
-    return path.join(hostDataPath, 'manager');
-  }
-  return '/app/data';
-}
-
-const DATA_DIR = getManagerDataPath();
+const DATA_DIR = config.managerDataPath;
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
 
 // Ensure data directory exists
@@ -53,7 +40,6 @@ async function ensureDataDir(): Promise<void> {
 async function readUsers(): Promise<UsersData> {
   try {
     const content = await readFile(USERS_FILE, 'utf-8');
-    console.log('READING USERS FROM', USERS_FILE);
     const data = JSON.parse(content) as UsersData;
 
     // Migrate users from old role field to new roleId field

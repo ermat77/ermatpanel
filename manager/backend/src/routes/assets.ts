@@ -46,7 +46,9 @@ function setCachedIconPath(itemId: string, path: string | null): void {
 
 // GET /api/assets/status - Get extraction status
 router.get('/status', authMiddleware, requirePermission('assets.view'), async (_req: Request, res: Response) => {
+  console.log('[Assets] GET /api/assets/status requested');
   const status = await assetService.getAssetStatus();
+  console.log('[Assets] GET /api/assets/status response: sourceExists =', status.sourceExists, 'sourceFile =', status.sourceFile ?? '(null)');
   res.json(status);
 });
 

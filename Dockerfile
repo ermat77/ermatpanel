@@ -50,13 +50,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN groupadd -g 9999 hytale \
     && useradd -u 9999 -g hytale -m -s /bin/bash hytale \
     && mkdir -p /opt/hytale/server \
-                /opt/hytale/data \
-                /opt/hytale/backups \
-                /opt/hytale/plugins \
-                /opt/hytale/mods \
-                /opt/hytale/logs \
-                /opt/hytale/downloader \
-                /opt/hytale/auth \
     && chown -R hytale:hytale /opt/hytale
 
 WORKDIR /opt/hytale
@@ -69,15 +62,9 @@ COPY --chmod=755 scripts/start-server.sh /opt/hytale/start-server.sh
 COPY --chmod=755 scripts/backup.sh /opt/hytale/backup.sh
 
 # ============================================================
-# Volumes for persistent data
+# Persistent data: mount /opt/hytale/server via compose (bind or named volume).
+# No VOLUME here to avoid anonymous volume IDs when bind mount is used.
 # ============================================================
-# NOTE: Server files (HytaleServer.jar, Assets.zip) must be provided via:
-#   - Volume mounts (bind mount from host hytale-server/ folder)
-#   - Download URLs (SERVER_JAR_URL, ASSETS_URL environment variables)
-#   - Hytale Downloader (USE_HYTALE_DOWNLOADER=true)
-# Bundling mechanism removed to reduce build time.
-# ============================================================
-VOLUME ["/opt/hytale/data", "/opt/hytale/backups", "/opt/hytale/plugins", "/opt/hytale/mods", "/opt/hytale/server", "/opt/hytale/downloader", "/opt/hytale/auth"]
 
 # ============================================================
 # Expose UDP port (QUIC protocol)

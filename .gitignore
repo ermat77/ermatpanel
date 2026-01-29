@@ -7,7 +7,7 @@
 !manager/backend/assets/plugins/*.jar
 
 # Local test data
-data/
+manager-data/
 backups/
 logs/
 server/

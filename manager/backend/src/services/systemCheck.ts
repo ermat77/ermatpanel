@@ -307,14 +307,9 @@ async function checkDiskSpace(): Promise<SystemCheck> {
     required: true,
   };
 
-  // Determine the correct data path based on environment:
-  // - In Docker (production): Use container path (mounted volume)
-  // - In dev (not in Docker): Use host path (absolute path on host machine)
-  const isInDocker = fs.existsSync('/.dockerenv') || !!process.env.DOCKER_CONTAINER;
-  const dataPath = isInDocker 
-    ? config.hytaleContainerDataPath  // Docker: /opt/hytale/data (mounted from host)
-    : path.join(config.hostDataPath, 'data');  // Dev: hostDataPath/data (absolute host path)
-  const hostDataPath = config.hostDataPath;
+  // Direct fs: use game data path (server root) and data subdir
+  const dataPath = path.join(config.gameDataPath, 'data');
+  const gameServerPath = config.gameDataPath;
   const minSpaceGB = 10;
   const minSpaceBytes = minSpaceGB * 1024 * 1024 * 1024;
 
@@ -324,6 +319,7 @@ async function checkDiskSpace(): Promise<SystemCheck> {
     // Check if running on Windows (in dev mode)
     const isWindows = process.platform === 'win32';
 
+    const isInDocker = fs.existsSync('/.dockerenv') || !!process.env.DOCKER_CONTAINER;
     if (isWindows && !isInDocker) {
       // Windows: Use PowerShell to get disk space
       // Get the drive letter from the path (e.g., C from C:/Users/... or C:\Users\...)
@@ -378,11 +374,11 @@ async function checkDiskSpace(): Promise<SystemCheck> {
     if (availableBytes >= minSpaceBytes) {
       check.status = 'ok';
       check.message = `${availableGB.toFixed(1)} GB available`;
-      check.details = `Path: ${hostDataPath}`;
+      check.details = `Path: ${gameServerPath}`;
     } else {
       check.status = 'error';
       check.message = `Only ${availableGB.toFixed(1)} GB available`;
-      check.details = `Minimum: ${minSpaceGB} GB at ${hostDataPath}`;
+      check.details = `Minimum: ${minSpaceGB} GB at ${gameServerPath}`;
     }
   } catch (error) {
     const err = error as Error;
@@ -453,14 +449,9 @@ async function checkWritePermissions(): Promise<SystemCheck> {
     required: true,
   };
 
-  // Determine the correct data path based on environment:
-  // - In Docker (production): Use container path (mounted volume)
-  // - In dev (not in Docker): Use host path (absolute path on host machine)
-  const isInDocker = fs.existsSync('/.dockerenv') || !!process.env.DOCKER_CONTAINER;
-  const dataPath = isInDocker 
-    ? config.hytaleContainerDataPath  // Docker: /opt/hytale/data (mounted from host)
-    : path.join(config.hostDataPath, 'data');  // Dev: hostDataPath/data (absolute host path)
-  const hostDataPath = config.hostDataPath;
+  // Direct fs: use game data path and data subdir
+  const dataPath = path.join(config.gameDataPath, 'data');
+  const gameServerPath = config.gameDataPath;
   const testFileName = `.write-test-${Date.now()}-${Math.random().toString(36).substring(7)}`;
   const testFilePath = path.join(dataPath, testFileName);
 
@@ -479,18 +470,18 @@ async function checkWritePermissions(): Promise<SystemCheck> {
 
     check.status = 'ok';
     check.message = 'Writable';
-    check.details = `Path: ${hostDataPath}/data`;
+    check.details = `Path: ${gameServerPath}/data`;
   } catch (error) {
     const err = error as NodeJS.ErrnoException;
 
     if (err.code === 'EACCES') {
       check.status = 'error';
       check.message = 'Permission denied';
-      check.details = `Cannot write to ${hostDataPath}/data. Run: sudo mkdir -p ${hostDataPath}/data && sudo chown -R 1000:1000 ${hostDataPath}`;
+      check.details = `Cannot write to ${gameServerPath}/data. Run: sudo mkdir -p ${gameServerPath}/data && sudo chown -R 1000:1000 ${gameServerPath}`;
     } else if (err.code === 'ENOENT') {
       check.status = 'error';
       check.message = 'Directory not found';
-      check.details = `Host path ${hostDataPath}/data does not exist. Run: sudo mkdir -p ${hostDataPath}/{data,server,backups,plugins,mods,auth,assets,downloader}`;
+      check.details = `Path ${gameServerPath}/data does not exist. Run: sudo mkdir -p ${gameServerPath}/data`;
     } else {
       check.status = 'error';
       check.message = 'Write failed';

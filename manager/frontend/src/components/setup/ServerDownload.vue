@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onUnmounted } from 'vue'
+import { ref, computed, onUnmounted, watch, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useSetupStore } from '@/stores/setup'
 import Button from '@/components/ui/Button.vue'
@@ -24,20 +24,38 @@ const currentDownloadStep = ref<DownloadStep>('select')
 // Download progress state
 const isDownloading = ref(false)
 const downloadProgress = ref({
-  status: 'idle' as 'idle' | 'downloading-downloader' | 'extracting-downloader' | 'downloading-server' | 'extracting-server' | 'complete' | 'error',
+  status: 'idle' as 'idle' | 'downloading-downloader' | 'extracting-downloader' | 'downloading-server' | 'extracting-server' | 'copying-to-container' | 'complete' | 'error',
   currentStep: '',
   stepProgress: 0,
   overallProgress: 0,
   message: '',
   error: undefined as string | undefined,
+  stdoutLines: [] as string[],
+  authUrl: undefined as string | undefined,
+  downloadPercent: undefined as number | undefined,
+  downloadMb: undefined as number | undefined,
+  downloadTotalGb: undefined as number | undefined,
 })
 
 // Download complete state
 const downloadComplete = ref(false)
 const downloadSkipped = ref(false)
+/** When manual copy is required, the docker cp command parts from the backend */
+const dockerCpCommand = ref<{ sourcePath: string; containerName: string; containerPath: string } | null>(null)
 
 // SSE cleanup function
 let cleanupSSE: (() => void) | null = null
+
+// Log container ref for auto-scroll
+const logContainerRef = ref<HTMLElement | null>(null)
+watch(
+  () => downloadProgress.value.stdoutLines.length,
+  () => {
+    nextTick(() => {
+      logContainerRef.value?.scrollTo({ top: logContainerRef.value.scrollHeight, behavior: 'smooth' })
+    })
+  }
+)
 
 // Handle option selection
 function selectOption(option: DownloadOption) {
@@ -60,30 +78,63 @@ async function proceedFromSelect() {
 async function startDownload() {
   isDownloading.value = true
 
-  // Subscribe to SSE progress updates
-  cleanupSSE = subscribeToServerDownloadProgress(
+  // Subscribe to SSE progress first so the GET /progress connection is open
+  const { cleanup, ready } = subscribeToServerDownloadProgress(
     handleDownloadProgress,
     handleDownloadComplete,
     handleDownloadError
   )
+  cleanupSSE = cleanup
 
   try {
-    // Trigger the download on the backend
+    // Wait for the first SSE event so the connection is established and the backend has our listener
+    await ready
+    // Then trigger the download so progress updates are pushed to our open connection
     await setupApi.startServerDownload()
-  } catch (err) {
-    handleDownloadError(err instanceof Error ? err.message : t('setup.serverDownloadStartFailed'))
+  } catch (err: unknown) {
+    const axiosErr = err as { response?: { data?: { error?: string } }; message?: string; code?: string }
+    const apiError = axiosErr?.response?.data?.error
+    const message = apiError ?? (err instanceof Error ? err.message : t('setup.serverDownloadStartFailed'))
+    // If the POST timed out, the backend may still be running – don't close SSE so we keep receiving progress
+    const isTimeout = message.toLowerCase().includes('timeout') || axiosErr?.code === 'ECONNABORTED'
+    if (isTimeout) {
+      // Keep SSE open; show warning but progress will still stream until complete/error
+      setupStore.setError(t('setup.serverDownloadRequestTimeout', 'Request timed out – download may still be in progress. Watch the progress below.'))
+    } else {
+      handleDownloadError(message)
+    }
   }
 }
 
 // Handle download progress events
-function handleDownloadProgress(event: ProgressEvent & { status?: string; currentStep?: string; stepProgress?: number; overallProgress?: number; message?: string }) {
-  downloadProgress.value = {
-    status: (event.status || event.type || 'idle') as typeof downloadProgress.value.status,
-    currentStep: event.currentStep || event.message || '',
-    stepProgress: event.stepProgress || event.percent || 0,
-    overallProgress: event.overallProgress || event.percent || 0,
-    message: event.message || event.currentStep || '',
+function handleDownloadProgress(event: ProgressEvent & { status?: string; currentStep?: string; stepProgress?: number; overallProgress?: number; message?: string; stdoutLines?: string[]; authUrl?: string; dockerCp?: { sourcePath: string; containerName: string; containerPath: string } }) {
+  const prev = downloadProgress.value
+  const eventLines = Array.isArray(event.stdoutLines) ? event.stdoutLines : null
+  // Only replace stdoutLines when server sends a longer or equal array (avoid overwriting with stale empty/short array)
+  const stdoutLines =
+    eventLines != null && eventLines.length >= (prev.stdoutLines?.length ?? 0)
+      ? eventLines
+      : prev.stdoutLines
+
+  // Use ?? so we never overwrite with undefined; progress bars never go backwards
+  const newOverall = event.overallProgress ?? event.percent ?? prev.overallProgress ?? 0;
+  const newStepProgress = event.stepProgress ?? event.percent ?? prev.stepProgress ?? 0;
+  const next = {
+    status: (event.status ?? event.type ?? 'idle') as typeof downloadProgress.value.status,
+    currentStep: event.currentStep ?? event.message ?? '',
+    stepProgress: Math.max(newStepProgress, prev.stepProgress ?? 0),
+    overallProgress: Math.max(newOverall, prev.overallProgress ?? 0),
+    message: event.message ?? event.currentStep ?? prev.message ?? '',
     error: event.error,
+    stdoutLines,
+    authUrl: event.authUrl ?? prev.authUrl,
+    downloadPercent: event.downloadPercent ?? prev.downloadPercent,
+    downloadMb: event.downloadMb ?? prev.downloadMb,
+    downloadTotalGb: event.downloadTotalGb ?? prev.downloadTotalGb,
+  }
+  downloadProgress.value = next
+  if (event.dockerCp) {
+    dockerCpCommand.value = event.dockerCp
   }
 }
 
@@ -102,29 +153,105 @@ function handleDownloadComplete() {
 function handleDownloadError(error: string) {
   isDownloading.value = false
   setupStore.setError(error)
+  // Set progress to error state so the UI shows error (not stuck at last %)
+  downloadProgress.value = {
+    ...downloadProgress.value,
+    status: 'error',
+    error,
+  }
   if (cleanupSSE) {
     cleanupSSE()
     cleanupSSE = null
   }
 }
 
-// Get step name for display
-function getStepName(status: string): string {
-  switch (status) {
-    case 'downloading-downloader':
-      return t('setup.serverDownloadStepDownloader')
-    case 'extracting-downloader':
-      return t('setup.serverDownloadStepExtractDownloader')
-    case 'downloading-server':
-      return t('setup.serverDownloadStepDownloadServer')
-    case 'extracting-server':
-      return t('setup.serverDownloadStepExtractServer')
-    case 'complete':
-      return t('setup.serverDownloadStepComplete')
-    default:
-      return t('setup.serverDownloadStepIdle')
+// Detect URL in text for clickable link (single line)
+const URL_REGEX = /(https?:\/\/[^\s]+)/g
+function lineToParts(line: string): { type: 'text' | 'url'; value: string }[] {
+  const parts: { type: 'text' | 'url'; value: string }[] = []
+  let lastIndex = 0
+  let m: RegExpExecArray | null
+  URL_REGEX.lastIndex = 0
+  while ((m = URL_REGEX.exec(line)) !== null) {
+    if (m.index > lastIndex) {
+      parts.push({ type: 'text', value: line.slice(lastIndex, m.index) })
+    }
+    parts.push({ type: 'url', value: m[1] })
+    lastIndex = m.index + m[1].length
   }
+  if (lastIndex < line.length) {
+    parts.push({ type: 'text', value: line.slice(lastIndex) })
+  }
+  return parts.length ? parts : [{ type: 'text', value: line }]
 }
+
+// Four sub-steps within "Download server files", each with state and step-specific display
+type SubstepState = 'pending' | 'active' | 'done'
+const SUBSTEP_ORDER = ['download-downloader', 'authenticate', 'download-game', 'extract', 'copy-to-container'] as const
+type SubstepId = (typeof SUBSTEP_ORDER)[number]
+
+const downloadSubsteps = computed(() => {
+  const p = downloadProgress.value
+  const status = p.status
+  const steps: { id: SubstepId; labelKey: string; state: SubstepState; detail?: string }[] = []
+
+  const step1Active = status === 'downloading-downloader' || status === 'extracting-downloader'
+  const step1Done = ['downloading-server', 'extracting-server', 'copying-to-container', 'complete'].includes(status)
+  steps.push({
+    id: 'download-downloader',
+    labelKey: 'setup.serverDownloadSubstepDownloadDownloader',
+    state: step1Done ? 'done' : step1Active ? 'active' : 'pending',
+    detail: step1Active ? p.message : undefined,
+  })
+
+  const inDownloadServer = status === 'downloading-server'
+  const authNeeded = inDownloadServer && p.authUrl && (p.downloadPercent == null || p.downloadPercent === 0)
+  const step2Done = (inDownloadServer && (p.downloadPercent != null && p.downloadPercent > 0)) || ['extracting-server', 'copying-to-container', 'complete'].includes(status)
+  steps.push({
+    id: 'authenticate',
+    labelKey: 'setup.serverDownloadSubstepAuthenticate',
+    state: step2Done ? 'done' : authNeeded ? 'active' : 'pending',
+    detail: authNeeded ? (p.authUrl ? t('setup.downloaderAuthClickToOpen') : p.message) : undefined,
+  })
+
+  const step3Active = inDownloadServer && p.downloadPercent != null
+  const step3Done = ['extracting-server', 'copying-to-container', 'complete'].includes(status)
+  steps.push({
+    id: 'download-game',
+    labelKey: 'setup.serverDownloadSubstepDownloadGame',
+    state: step3Done ? 'done' : step3Active ? 'active' : 'pending',
+    detail: step3Active && p.downloadPercent != null
+      ? `${p.downloadPercent.toFixed(1)}%${p.downloadMb != null && p.downloadTotalGb != null ? ` (${p.downloadMb.toFixed(1)} MB / ${p.downloadTotalGb.toFixed(1)} GB)` : ''}`
+      : undefined,
+  })
+
+  const extractMatch = p.message?.match(/\((\d+)\/(\d+)\s+files\)/)
+  const extractCurrent = extractMatch ? parseInt(extractMatch[1], 10) : null
+  const extractTotal = extractMatch ? parseInt(extractMatch[2], 10) : null
+  const step4Active = status === 'extracting-server'
+  const step4Done = status === 'copying-to-container' || status === 'complete'
+  steps.push({
+    id: 'extract',
+    labelKey: 'setup.serverDownloadSubstepExtract',
+    state: step4Done ? 'done' : step4Active ? 'active' : 'pending',
+    detail: step4Active && extractCurrent != null && extractTotal != null
+      ? `${extractCurrent}/${extractTotal} ${t('setup.files', 'files')}`
+      : step4Active
+        ? p.message
+        : undefined,
+  })
+
+  const step5Active = status === 'copying-to-container'
+  const step5Done = status === 'complete'
+  steps.push({
+    id: 'copy-to-container',
+    labelKey: 'setup.serverDownloadSubstepCopyToContainer',
+    state: step5Done ? 'done' : step5Active ? 'active' : 'pending',
+    detail: step5Active ? p.message : undefined,
+  })
+
+  return steps
+})
 
 // Handle continue to next step
 async function handleContinue() {
@@ -144,6 +271,7 @@ function handleBack() {
     currentDownloadStep.value = 'select'
     downloadComplete.value = false
     downloadSkipped.value = false
+    dockerCpCommand.value = null
     downloadProgress.value = {
       status: 'idle',
       currentStep: '',
@@ -151,6 +279,11 @@ function handleBack() {
       overallProgress: 0,
       message: '',
       error: undefined,
+      stdoutLines: [],
+      authUrl: undefined,
+      downloadPercent: undefined,
+      downloadMb: undefined,
+      downloadTotalGb: undefined,
     }
     return
   }
@@ -249,33 +382,163 @@ onUnmounted(() => {
       </div>
     </template>
 
-    <!-- Step 2: Download Progress -->
+    <!-- Step 2: Download Progress – four sub-steps with distinct components -->
     <template v-else-if="currentDownloadStep === 'downloading'">
       <div class="card">
         <div class="card-body">
-          <!-- Download status -->
-          <div class="text-center py-8">
-            <!-- Animated download icon -->
-            <div class="inline-flex items-center justify-center w-20 h-20 bg-hytale-orange/20 rounded-2xl mb-6">
-              <svg class="w-10 h-10 text-hytale-orange animate-pulse" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-              </svg>
-            </div>
+          <h3 class="text-xl font-semibold text-white mb-6">{{ t('setup.serverDownloadingTitle') }}</h3>
 
-            <h3 class="text-xl font-semibold text-white mb-2">{{ t('setup.serverDownloadingTitle') }}</h3>
-            <p class="text-gray-400 mb-2">{{ downloadProgress.message || t('setup.serverDownloadingDescription') }}</p>
-            <p class="text-sm text-gray-500 mb-6">{{ getStepName(downloadProgress.status) }}</p>
-
-            <!-- Progress bar -->
-            <div class="max-w-md mx-auto">
-              <div class="h-2 bg-dark-50 rounded-full overflow-hidden mb-2">
+          <!-- Sub-step stepper -->
+          <div class="space-y-4 max-w-2xl mx-auto">
+            <div
+              v-for="(step, idx) in downloadSubsteps"
+              :key="step.id"
+              class="rounded-lg border transition-colors"
+              :class="{
+                'border-hytale-orange/50 bg-hytale-orange/5': step.state === 'active',
+                'border-dark-50/50 bg-dark-300/50': step.state === 'pending',
+                'border-status-success/30 bg-status-success/5': step.state === 'done',
+              }"
+            >
+              <div class="px-4 py-3 flex items-center gap-3">
+                <!-- Step indicator -->
                 <div
-                  class="h-full bg-gradient-to-r from-hytale-orange to-hytale-yellow transition-all duration-300"
-                  :style="{ width: `${downloadProgress.overallProgress}%` }"
-                />
+                  class="flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center text-sm font-medium"
+                  :class="{
+                    'bg-hytale-orange text-white': step.state === 'active',
+                    'bg-dark-50 text-gray-500': step.state === 'pending',
+                    'bg-status-success/20 text-status-success': step.state === 'done',
+                  }"
+                >
+                  <svg v-if="step.state === 'done'" class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+                  </svg>
+                  <span v-else>{{ idx + 1 }}</span>
+                </div>
+                <div class="min-w-0 flex-1">
+                  <p
+                    class="font-medium"
+                    :class="{
+                      'text-hytale-orange': step.state === 'active',
+                      'text-gray-500': step.state === 'pending',
+                      'text-status-success': step.state === 'done',
+                    }"
+                  >
+                    {{ t(step.labelKey) }}
+                  </p>
+                  <p v-if="step.detail" class="text-sm text-gray-400 mt-0.5 truncate">
+                    {{ step.detail }}
+                  </p>
+                </div>
               </div>
-              <div class="text-sm text-gray-400">
-                {{ downloadProgress.overallProgress }}% {{ t('setup.complete') }}
+
+              <!-- Step 1: Download downloader – message only -->
+              <div
+                v-if="step.id === 'download-downloader' && step.state === 'active' && step.detail"
+                class="px-4 pb-3 pt-0 text-sm text-gray-400"
+              >
+                {{ step.detail }}
+              </div>
+
+              <!-- Step 2: Authenticate – auth URL card -->
+              <div
+                v-if="step.id === 'authenticate' && step.state === 'active' && downloadProgress.authUrl"
+                class="px-4 pb-4 pt-0"
+              >
+                <p class="text-sm text-gray-300 mb-3">
+                  {{ t('setup.downloaderAuthClickToOpen') }}
+                </p>
+                <a
+                  :href="downloadProgress.authUrl"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  class="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-hytale-orange text-white font-medium hover:bg-hytale-orange/90 transition-colors"
+                >
+                  {{ t('setup.downloaderAuthOpenLink') }}
+                </a>
+                <p class="mt-2 text-xs text-gray-500 break-all">
+                  {{ downloadProgress.authUrl }}
+                </p>
+              </div>
+
+              <!-- Step 3: Download game files – progress bar + MB/GB -->
+              <div
+                v-if="step.id === 'download-game' && step.state === 'active'"
+                class="px-4 pb-4 pt-0"
+              >
+                <div
+                  v-if="downloadProgress.downloadPercent != null"
+                  class="space-y-2"
+                >
+                  <div class="h-3 bg-dark-50 rounded-full overflow-hidden">
+                    <div
+                      class="h-full bg-gradient-to-r from-hytale-orange to-hytale-yellow transition-all duration-300"
+                      :style="{ width: `${Math.min(100, downloadProgress.downloadPercent ?? 0)}%` }"
+                    />
+                  </div>
+                  <p class="text-sm text-gray-400">
+                    {{ (downloadProgress.downloadPercent ?? 0).toFixed(1) }}%
+                    <template v-if="downloadProgress.downloadMb != null && downloadProgress.downloadTotalGb != null">
+                      ({{ downloadProgress.downloadMb.toFixed(1) }} MB / {{ downloadProgress.downloadTotalGb.toFixed(1) }} GB)
+                    </template>
+                  </p>
+                </div>
+                <p v-else class="text-sm text-gray-500 italic">
+                  {{ t('setup.downloaderWaiting') }}
+                </p>
+              </div>
+
+              <!-- Step 4: Extract files – file count progress -->
+              <div
+                v-if="step.id === 'extract' && step.state === 'active'"
+                class="px-4 pb-4 pt-0"
+              >
+                <p class="text-sm text-gray-400">
+                  {{ downloadProgress.message || t('setup.serverDownloadStepExtractServer') }}
+                </p>
+              </div>
+
+              <!-- Step 5: Copy to game container – last sub-step -->
+              <div
+                v-if="step.id === 'copy-to-container' && step.state === 'active'"
+                class="px-4 pb-4 pt-0"
+              >
+                <p class="text-sm text-gray-400">
+                  {{ downloadProgress.message || t('setup.serverDownloadSubstepCopyToContainer') }}
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <!-- Downloader stdout (during download-game or authenticate) -->
+          <div
+            v-if="downloadProgress.status === 'downloading-server' && downloadProgress.stdoutLines.length > 0"
+            class="max-w-2xl mx-auto mt-6 rounded-lg bg-dark-300 border border-dark-50/50 overflow-hidden"
+          >
+            <div class="px-3 py-2 text-xs text-gray-500 border-b border-dark-50/50">
+              {{ t('setup.downloaderOutput') }}
+            </div>
+            <div
+              class="p-3 font-mono text-sm text-gray-300 overflow-y-auto max-h-32 scroll-smooth"
+              ref="logContainerRef"
+            >
+              <div
+                v-for="(line, lineIdx) in downloadProgress.stdoutLines"
+                :key="lineIdx"
+                class="leading-relaxed break-all"
+              >
+                <template v-for="(part, i) in lineToParts(line)" :key="i">
+                  <a
+                    v-if="part.type === 'url'"
+                    :href="part.value"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="text-hytale-orange hover:underline"
+                  >
+                    {{ part.value }}
+                  </a>
+                  <span v-else>{{ part.value }}</span>
+                </template>
               </div>
             </div>
           </div>
@@ -306,6 +569,18 @@ onUnmounted(() => {
             </div>
             <p class="text-white font-semibold text-lg mb-2">{{ t('setup.serverDownloadSuccess') }}</p>
             <p class="text-gray-400">{{ t('setup.serverDownloadSuccessDesc') }}</p>
+
+            <!-- Manual copy: docker cp helper command -->
+            <div
+              v-if="dockerCpCommand"
+              class="mt-6 p-4 rounded-lg bg-dark-300 border border-dark-50/50 text-left"
+            >
+              <p class="text-gray-300 text-sm font-medium mb-2">{{ t('setup.serverDownloadManualCopyTitle') }}</p>
+              <p class="text-gray-400 text-sm mb-3">{{ t('setup.serverDownloadManualCopyDesc') }}</p>
+              <code class="block p-3 rounded bg-dark-200 text-gray-200 text-sm font-mono break-all select-all">
+                docker cp '{{ dockerCpCommand.sourcePath }}' '{{ dockerCpCommand.containerName }}:{{ dockerCpCommand.containerPath }}/'
+              </code>
+            </div>
           </div>
 
           <!-- Skipped State -->

@@ -523,10 +523,6 @@ export async function installPlugin(): Promise<{ success: boolean; error?: strin
       console.warn(`[KyuubiAPI]   This might cause issues when using Docker API`);
     }
     
-    // Use posix.join to ensure proper path construction
-    const targetPath = path.posix.join(modsPathNormalized, PLUGIN_JAR_NAME);
-    // Ensure we have a clean absolute path
-    const normalizedTargetPath = path.posix.normalize(targetPath);
     // Check if bundled JAR exists
     if (!fs.existsSync(bundledPath)) {
       console.error(`[KyuubiAPI] ❌ Plugin JAR not found at bundled path: ${bundledPath}`);
@@ -553,61 +549,49 @@ export async function installPlugin(): Promise<{ success: boolean; error?: strin
     console.log(`[KyuubiAPI] Found ${files.length} files in plugins directory`);
     console.log(`[KyuubiAPI] Files list:`, files);
     
+    const modsDirLocal = path.join(config.gameDataPath, 'mods');
     let oldVersionsRemoved = 0;
     for (const file of files) {
       const cleanedFile = cleanFilename(file);
       if (cleanedFile.toLowerCase().startsWith('kyuubisoftapi') && cleanedFile.endsWith('.jar')) {
         console.log(`[KyuubiAPI] Found old plugin version: ${cleanedFile}`);
-        
-        // Use posix.join to ensure forward slashes for container paths
-        const oldFilePath = path.posix.join(modsPathNormalized, file);
-        console.log(`[KyuubiAPI] Removing old version via Docker API: ${oldFilePath}`);
+        const oldFilePathLocal = path.join(modsDirLocal, file);
+        console.log(`[KyuubiAPI] Removing old version: ${oldFilePathLocal}`);
         try {
-          await dockerService.execCommand(`rm -f "${oldFilePath}"`);
+          await fs.promises.unlink(oldFilePathLocal);
           console.log(`[KyuubiAPI] ✅ Successfully removed old version: ${file}`);
           oldVersionsRemoved++;
         } catch (deleteError) {
-          console.error(`[KyuubiAPI] ❌ Failed to remove old version via Docker: ${file}`, deleteError);
+          console.error(`[KyuubiAPI] ❌ Failed to remove old version: ${file}`, deleteError);
           throw deleteError;
         }
       }
     }
-    
+
     if (oldVersionsRemoved === 0) {
       console.log(`[KyuubiAPI] No old plugin versions found to remove`);
     } else {
       console.log(`[KyuubiAPI] Removed ${oldVersionsRemoved} old plugin version(s)`);
     }
 
-    // Copy new version
-    // Always use Docker API to copy file to container
+    // Copy new version (direct fs to game data path)
+    const targetPathLocal = path.join(modsDirLocal, PLUGIN_JAR_NAME);
     console.log(`[KyuubiAPI] Copying new plugin version...`);
-    console.log(`[KyuubiAPI]   Source (host): ${bundledPath}`);
-    console.log(`[KyuubiAPI]   Target (container): ${normalizedTargetPath}`);
-    
+    console.log(`[KyuubiAPI]   Source: ${bundledPath}`);
+    console.log(`[KyuubiAPI]   Target: ${targetPathLocal}`);
+
     try {
-      await dockerService.copyFileToContainer(bundledPath, normalizedTargetPath);
-      console.log(`[KyuubiAPI] ✅ Successfully copied plugin via Docker API`);
-      
-      // Verify the file was copied
-      // Use absolute path with forward slashes for the verification command
-      const verifyPath = normalizedTargetPath; // Already normalized to absolute path with forward slashes
-      console.log(`[KyuubiAPI] Verifying plugin at path: ${verifyPath}`);
-      try {
-        // Use absolute path starting with / for the command
-        const verifyResult = await dockerService.execCommand(`test -f "${verifyPath}" && echo "EXISTS" || echo "NOT_FOUND"`);
-        console.log(`[KyuubiAPI] Verification result:`, verifyResult);
-        if (verifyResult.output?.includes('EXISTS')) {
-          console.log(`[KyuubiAPI] ✅ Verified: Plugin file exists at target path: ${verifyPath}`);
-        } else {
-          console.warn(`[KyuubiAPI] ⚠️  Warning: Could not verify plugin file at target path: ${verifyPath}`);
-          console.warn(`[KyuubiAPI]   Verification output: ${verifyResult.output || 'no output'}`);
-        }
-      } catch (verifyError) {
-        console.warn(`[KyuubiAPI] ⚠️  Could not verify plugin installation:`, verifyError);
+      await fs.promises.mkdir(modsDirLocal, { recursive: true });
+      await fs.promises.copyFile(bundledPath, targetPathLocal);
+      console.log(`[KyuubiAPI] ✅ Successfully copied plugin`);
+
+      if (fs.existsSync(targetPathLocal)) {
+        console.log(`[KyuubiAPI] ✅ Verified: Plugin file exists at target path`);
+      } else {
+        console.warn(`[KyuubiAPI] ⚠️  Warning: Could not verify plugin file after copy`);
       }
     } catch (copyError) {
-      console.error(`[KyuubiAPI] ❌ Failed to copy plugin via Docker API:`, copyError);
+      console.error(`[KyuubiAPI] ❌ Failed to copy plugin:`, copyError);
       throw copyError;
     }
 

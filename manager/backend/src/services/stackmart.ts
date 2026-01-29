@@ -124,7 +124,7 @@ interface InstalledResourcesData {
 const INSTALLED_RESOURCES_FILE = 'stackmart-installed.json';
 
 function getInstalledResourcesPath(): string {
-  return path.join(config.hytaleContainerDataPath, INSTALLED_RESOURCES_FILE);
+  return path.join(config.hytaleContainerServerPath, INSTALLED_RESOURCES_FILE);
 }
 
 async function loadInstalledResources(): Promise<InstalledResourcesData> {
@@ -507,7 +507,7 @@ export async function installResourceFromStackMart(
     case 'scripts':
     case 'tools':
     default:
-      targetPath = config.hytaleContainerDataPath;
+      targetPath = config.hytaleContainerServerPath;
   }
 
   // Ensure target directory exists
@@ -583,7 +583,7 @@ export async function uninstallStackMart(resourceId: string): Promise<{ success:
       basePath = config.hytaleContainerModsPath;
       break;
     default:
-      basePath = config.hytaleContainerDataPath;
+      basePath = config.hytaleContainerServerPath;
   }
 
   const filePath = path.join(basePath, installed.filename);

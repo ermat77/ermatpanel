@@ -12,9 +12,8 @@ import * as fileAccess from '../utils/fileAccess.js';
 // Always use container paths
 export function getWorldsPaths(): string[] {
   return [
-    path.posix.join(config.hytaleContainerDataPath, 'worlds'),                    // /opt/hytale/data/worlds
-    path.posix.join(config.hytaleContainerServerPath, 'universe', 'worlds'),      // /opt/hytale/server/universe/worlds (symlink)
-    path.posix.join(config.hytaleContainerServerPath, 'worlds'),                  // /opt/hytale/server/worlds (fallback)
+    path.posix.join(config.hytaleContainerServerPath, 'worlds'),                    // /opt/hytale/server/worlds
+    path.posix.join(config.hytaleContainerServerPath, 'universe', 'worlds'),            // /opt/hytale/server/universe/worlds (fallback)
   ];
 }
 

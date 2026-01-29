@@ -10,6 +10,7 @@ import {
   startAssetsExtraction,
   getDownloadProgress,
   getServerDownloadProgress,
+  subscribeServerDownloadProgress,
   startServerDownload,
   getAuthStatusForSetup,
   resetSetup,
@@ -1197,50 +1198,53 @@ router.post('/server-download/start', async (_req: Request, res: Response) => {
  * GET /api/setup/server-download/status
  * Server-Sent Events endpoint for server download progress
  *
- * Response: SSE stream with ServerDownloadProgress objects
+ * Progress is pushed immediately when setServerDownloadProgress is called (e.g. authUrl, stdout lines),
+ * so the frontend gets OAuth URLs and log lines in real time without waiting for a poll interval.
  */
 const serverDownloadProgressHandler = (req: Request, res: Response) => {
-  // Set headers for SSE
+  // Set headers for SSE (X-Accel-Buffering: no helps proxies/Vite not buffer the stream)
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders(); // Commit response so client sees connection as open immediately
 
-  // Send initial status
-  const sendStatus = () => {
-    const progress = getServerDownloadProgress();
+  const flush = () => {
+    if (typeof (res as any).flush === 'function') (res as any).flush();
+  };
 
-    // Map status to type for frontend compatibility
+  const buildResponse = (progress: ReturnType<typeof getServerDownloadProgress>) => {
     const type = progress.status === 'complete' ? 'complete'
       : progress.status === 'error' ? 'error'
       : 'progress';
-
-    // Send response with both status (backend) and type (frontend) fields
-    const response = {
+    return {
       ...progress,
       type,
+      stdoutLines: progress.stdoutLines ?? [],
     };
-
-    res.write(`data: ${JSON.stringify(response)}\n\n`);
-
-    // If download is complete or errored, close the connection after a short delay
-    if (progress.status === 'complete' || progress.status === 'error') {
-      setTimeout(() => {
-        clearInterval(interval);
-        res.end();
-      }, 1000);
-    }
   };
 
-  // Send status immediately
-  sendStatus();
+  // Send initial status so client receives first event and knows the stream is open
+  const initial = buildResponse(getServerDownloadProgress());
+  res.write(`data: ${JSON.stringify(initial)}\n\n`);
+  flush();
 
-  // Send updates every second
-  const interval = setInterval(sendStatus, 1000);
+  // Subscribe so we push immediately on every progress update (authUrl, stdout, etc.)
+  const unsubscribe = subscribeServerDownloadProgress((progress) => {
+    if (res.writableEnded) return;
+    const response = buildResponse(progress);
+    res.write(`data: ${JSON.stringify(response)}\n\n`);
+    flush();
+    if (progress.status === 'complete' || progress.status === 'error') {
+      setTimeout(() => {
+        unsubscribe();
+        res.end();
+      }, 500);
+    }
+  });
 
-  // Clean up on connection close
   req.on('close', () => {
-    clearInterval(interval);
+    unsubscribe();
   });
 };
 
@@ -1356,8 +1360,6 @@ router.get('/server-info', async (_req: Request, res: Response) => {
       serverPort: config.serverPort,
       gameContainerName: config.gameContainerName,
       serverPath: config.hytaleContainerServerPath,
-      dataPath: config.hytaleContainerDataPath,
-      hostDataPath: config.hostDataPath,
     });
   } catch (error) {
     console.error('[Setup] Failed to get server info:', error);

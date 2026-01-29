@@ -338,7 +338,6 @@ app.use((req, res, next) => {
   }
 
   const allowedOrigins = config.corsOrigins.split(',').map(o => o.trim()).filter(o => o !== '');
-
   // Also allow requests from the server's own origin (same-origin)
   const host = req.headers.host;
   const protocol = req.secure || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
@@ -452,42 +451,17 @@ interface PermissionHealthResponse {
 }
 
 app.get('/api/health/permissions', async (_req, res) => {
-  // Determine correct paths based on environment:
-  // - In Docker: Use container paths (mounted volumes)
-  // - In dev: Use host paths (absolute paths on host machine)
-  const isInDocker = fs.existsSync('/.dockerenv') || !!process.env.DOCKER_CONTAINER;
-  const pathsToCheck = isInDocker
-    ? [
-        { path: config.hytaleContainerServerPath, name: 'Server' },
-        { path: config.hytaleContainerBackupsPath, name: 'Backups' },
-        { path: config.hytaleContainerDataPath, name: 'Data' },
-        { path: config.hytaleContainerModsPath, name: 'Mods' },
-      ]
-    : [
-        { path: path.join(config.hostDataPath, 'server'), name: 'Server' },
-        { path: path.join(config.hostDataPath, 'backups'), name: 'Backups' },
-        { path: path.join(config.hostDataPath, 'data'), name: 'Data' },
-        { path: path.join(config.hostDataPath, 'mods'), name: 'Mods' },
-      ];
+  // Direct fs: check manager-accessible game paths (gameDataPath and subdirs)
+  const root = config.gameDataPath;
+  const pathsToCheck = [
+    { path: root, name: 'Server' },
+    { path: path.join(root, 'backups'), name: 'Backups' },
+    { path: path.join(root, 'data'), name: 'Data' },
+    { path: path.join(root, 'mods'), name: 'Mods' },
+  ];
 
   const results: PermissionCheckResult[] = [];
   let hasIssues = false;
-
-  // Check if container is running first
-  const containerStatus = await dockerService.getStatus();
-  if (!containerStatus.running) {
-    return res.json({
-      ok: false,
-      issues: pathsToCheck.map(({ path: dirPath, name }) => ({
-        path: dirPath,
-        name,
-        readable: false,
-        writable: false,
-        error: 'Container not running',
-      })),
-      message: 'Cannot check permissions: Container is not running',
-    });
-  }
 
   for (const { path: dirPath, name } of pathsToCheck) {
     const result: PermissionCheckResult = {
@@ -498,44 +472,26 @@ app.get('/api/health/permissions', async (_req, res) => {
     };
 
     try {
-      // Check if directory is readable using Docker API
-      const readCheck = await dockerService.execInGameServerContainer(
-        `test -r "${dirPath}" && echo "READABLE" || echo "NOT_READABLE"`
-      );
-      
-      if (readCheck.success && readCheck.output?.includes('READABLE')) {
-        result.readable = true;
+      await fs.promises.mkdir(dirPath, { recursive: true });
+      await fs.promises.access(dirPath, fs.constants.R_OK);
+      result.readable = true;
 
-        // Check if directory is writable by trying to write a test file via Docker API
-        const testFileName = `.perm-test-${randomBytes(4).toString('hex')}`;
-        const testFilePath = path.posix.join(dirPath, testFileName);
-        
-        try {
-          // Try to write a test file
-          await dockerService.writeContainerFile(testFilePath, 'test');
-          
-          // Try to read it back
-          await dockerService.readContainerFile(testFilePath);
-          
-          // Delete the test file
-          const deleteResult = await dockerService.execInGameServerContainer(`rm -f "${testFilePath}"`);
-          
-          if (deleteResult.success) {
-            result.writable = true;
-          } else {
-            result.writable = false;
-            result.error = `Cannot delete test file: ${deleteResult.error || 'Unknown error'}`;
-            hasIssues = true;
-          }
-        } catch (writeErr) {
-          result.writable = false;
-          result.error = `Cannot write: ${writeErr instanceof Error ? writeErr.message : 'Unknown error'}`;
-          hasIssues = true;
-        }
-      } else {
-        result.readable = false;
-        result.error = `Cannot access: ${readCheck.error || 'Directory not readable'}`;
+      const testFileName = `.perm-test-${randomBytes(4).toString('hex')}`;
+      const testFilePath = path.join(dirPath, testFileName);
+      try {
+        await fs.promises.writeFile(testFilePath, 'test', 'utf-8');
+        await fs.promises.readFile(testFilePath, 'utf-8');
+        await fs.promises.unlink(testFilePath);
+        result.writable = true;
+      } catch (writeErr) {
+        result.writable = false;
+        result.error = `Cannot write: ${writeErr instanceof Error ? writeErr.message : 'Unknown error'}`;
         hasIssues = true;
+        try {
+          await fs.promises.unlink(testFilePath);
+        } catch {
+          // ignore
+        }
       }
     } catch (readErr) {
       result.readable = false;
@@ -552,7 +508,7 @@ app.get('/api/health/permissions', async (_req, res) => {
   };
 
   if (hasIssues) {
-    response.message = `Some directories have permission issues. This may happen after upgrading to v2.0.0 which runs as non-root. Run: sudo chown -R 1001:1001 ${config.hostDataPath}`;
+    response.message = `Some directories have permission issues. This may happen after upgrading to v2.0.0 which runs as non-root. Run: sudo chown -R 1001:1001 ${config.gameDataPath}`;
   }
 
   res.json(response);

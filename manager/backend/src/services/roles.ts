@@ -10,25 +10,10 @@ import {
 } from '../types/permissions.js';
 import { getUser, getAllUsers, invalidateUserTokens } from './users.js';
 
-// Path to roles file in the persistent data volume
-// Manager-specific files path:
-//   - If HOST_DATA_PATH env var is set: use it (override)
-//   - If running locally: use HOST_DATA_PATH/manager
-//   - If running in Docker: default to /app/data
-function getManagerDataPath(): string {
-  if (process.env.HOST_DATA_PATH) {
-    return process.env.HOST_DATA_PATH;
-  }
-  const fs = require('fs');
-  const isInDocker = fs.existsSync('/.dockerenv') || !!process.env.DOCKER_CONTAINER;
-  if (!isInDocker) {
-    const hostDataPath = process.env.HOST_DATA_PATH || '/opt/hytale';
-    return path.join(hostDataPath, 'manager');
-  }
-  return '/app/data';
-}
+import { config } from '../config.js';
 
-const DATA_DIR = getManagerDataPath();
+// Path to roles file in the persistent data volume (manager data path from config)
+const DATA_DIR = config.managerDataPath;
 const ROLES_FILE = path.join(DATA_DIR, 'roles.json');
 
 // Ensure data directory exists

@@ -4,11 +4,33 @@ import { requirePermission } from '../middleware/permissions.js';
 import {
   downloadServerFiles,
   extractServerFiles,
-  downloadAndExtractServerFiles,
-  checkServerFilesInstalled,
+  getDockerCpCommandIfReady,
 } from '../services/serverFileDownloader.js';
+import {
+  downloadAndExtractGameFiles,
+  checkGameFilesInstalled,
+} from '../services/gameFilesService.js';
 
 const router = Router();
+
+/**
+ * GET /api/server-files/docker-cp-command
+ * Get the docker cp helper command when server files are extracted on the manager (for manual copy to game container).
+ *
+ * Response:
+ * { dockerCp: { sourcePath, containerName, containerPath } | null }
+ */
+router.get('/docker-cp-command', authMiddleware, requirePermission('server.view_status'), async (_req: Request, res: Response) => {
+  try {
+    const dockerCp = getDockerCpCommandIfReady();
+    res.json({ dockerCp });
+  } catch (error) {
+    res.status(500).json({
+      dockerCp: null,
+      error: error instanceof Error ? error.message : 'Failed to get docker cp command',
+    });
+  }
+});
 
 /**
  * GET /api/server-files/status
@@ -19,7 +41,7 @@ const router = Router();
  */
 router.get('/status', authMiddleware, requirePermission('server.view_status'), async (_req: Request, res: Response) => {
   try {
-    const result = await checkServerFilesInstalled();
+    const result = await checkGameFilesInstalled();
     res.json(result);
   } catch (error) {
     res.status(500).json({
@@ -114,7 +136,7 @@ router.post('/download-and-extract', authMiddleware, requirePermission('server.r
       return;
     }
 
-    const result = await downloadAndExtractServerFiles(patchline);
+    const result = await downloadAndExtractGameFiles(patchline);
     if (!result.success) {
       res.status(400).json(result);
       return;

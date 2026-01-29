@@ -24,12 +24,11 @@ import bcrypt from 'bcryptjs';
 import { config, reloadConfigFromFile } from '../config.js';
 
 // Paths
-const DATA_DIR = config.hytaleContainerDataPath;
-const CONFIG_JSON_FILE = path.join(DATA_DIR, 'config.json');
-const SETUP_CONFIG_FILE = path.join(DATA_DIR, 'setup-config.json');
-const PANEL_CONFIG_FILE = path.join(DATA_DIR, 'panel-config.json');
-const USERS_FILE = path.join(DATA_DIR, 'users.json');
-const SERVER_CONFIG_FILE = path.join(config.hytaleContainerServerPath, 'config.json');
+const CONFIG_JSON_FILE = path.join(config.managerDataPath, 'config.json');
+const SETUP_CONFIG_FILE = path.join(config.managerDataPath, 'setup-config.json');
+const PANEL_CONFIG_FILE = path.join(config.managerDataPath, 'panel-config.json');
+const USERS_FILE = path.join(config.managerDataPath, 'users.json');
+const SERVER_CONFIG_FILE = path.join(config.managerDataPath, 'config.json');
 
 // Environment variable mapping
 interface EnvConfig {
@@ -253,8 +252,8 @@ export async function runMigration(): Promise<boolean> {
   console.log('[Migration] Starting migration of existing installation...');
 
   try {
-    // Ensure data directory exists
-    await mkdir(DATA_DIR, { recursive: true });
+    // Ensure server directory exists
+    await mkdir(config.managerDataPath, { recursive: true });
 
     // Read all source data
     const envConfig = readEnvConfig();

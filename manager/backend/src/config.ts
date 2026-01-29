@@ -65,32 +65,28 @@ export function isBackendInDocker(): boolean {
 // Config.json Integration
 // ============================================================
 
-// Path to config.json
 // Manager config files path:
-//   - If HOST_DATA_PATH env var is set: use it (override)
-//   - If running locally: use HOST_DATA_PATH/manager (consistent with game server paths)
-//   - If running in Docker: default to /app/data (Docker volume mount)
+//   - MANAGER_DATA_PATH (preferred) or HOST_DATA_PATH (deprecated fallback)
+//   - If running in Docker and not set: /app/data (manager-data volume)
+//   - If running locally and not set: ./manager-data under cwd
 function getManagerDataPath(): string {
-  // If explicitly set via env var, use it (override)
-  if (process.env.HOST_DATA_PATH) {
-    return process.env.HOST_DATA_PATH;
+  if (process.env.MANAGER_DATA_PATH) {
+    return process.env.MANAGER_DATA_PATH;
   }
-  
-  // If running locally (not in Docker), use HOST_DATA_PATH/manager
-  if (!isBackendInDocker()) {
-    const hostDataPath = process.env.HOST_DATA_PATH || '/opt/hytale';
-    return path.join(hostDataPath, 'manager');
+  if (isBackendInDocker()) {
+    return '/app/data';
   }
-  
-  // Running in Docker, use container path
-  return '/app/data';
+  return path.join(process.cwd(), 'manager-data');
 }
 
-const HOST_DATA_PATH = getManagerDataPath();
-const GAME_DATA_PATH = process.env.HYTALE_CONTAINER_DATA_PATH || process.env.DATA_PATH || '/opt/hytale/data';
+const MANAGER_DATA_PATH_RESOLVED = getManagerDataPath();
+
+// Container path base (for display / docker cp). Derive all hytaleContainer* from this.
+// Default /server matches typical mount (e.g. volume at /server); set GAME_CONTAINER_PATH to override.
+const GAME_CONTAINER_PATH_BASE = process.env.GAME_SERVER_DATA_PATH || '/server';
+
 // Try manager data path first, then game data path for backward compatibility
-const CONFIG_FILE_PATH = path.join(HOST_DATA_PATH, 'config.json');
-const CONFIG_FILE_PATH_FALLBACK = path.join(GAME_DATA_PATH, 'config.json');
+const CONFIG_FILE_PATH = path.join(MANAGER_DATA_PATH_RESOLVED, 'config.json');
 
 // Interface for config.json (simplified for this module)
 interface ConfigJson {
@@ -133,10 +129,6 @@ try {
     const content = fs.readFileSync(CONFIG_FILE_PATH, 'utf-8');
     configJson = JSON.parse(content);
     console.log('[Config] Loaded configuration from config.json (manager data)');
-  } else if (fs.existsSync(CONFIG_FILE_PATH_FALLBACK)) {
-    const content = fs.readFileSync(CONFIG_FILE_PATH_FALLBACK, 'utf-8');
-    configJson = JSON.parse(content);
-    console.log('[Config] Loaded configuration from config.json (game data, fallback)');
   }
 } catch (error) {
   console.log('[Config] Could not load config.json, using environment variables');
@@ -233,22 +225,27 @@ export const config = {
   // Falls back to STACK_NAME if GAME_CONTAINER_NAME is not set
   gameContainerName: process.env.GAME_CONTAINER_NAME || process.env.STACK_NAME || 'hytale',
 
-  // Host data path (base path for all data directories)
-  // Always points to Docker container path - HytaleServer always runs in Docker
-  hostDataPath: process.env.HOST_DATA_PATH || '/opt/hytale',
+  gameDataPath: process.env.GAME_SERVER_DATA_PATH || '/opt/hytale/server',
 
-  // Host downloader path (where downloader is stored on host)
-  hostDownloaderPath: process.env.HOST_DOWNLOADER_PATH || path.join(process.env.HOST_DATA_PATH || '/opt/hytale', 'downloader'),
+  // Manager data path (config.json, users.json, etc.)
+  managerDataPath: MANAGER_DATA_PATH_RESOLVED,
 
-  // Container paths - ALWAYS use these when accessing via Docker API
-  // These are the paths inside the Hytale server container
-  hytaleContainerServerPath: process.env.HYTALE_CONTAINER_SERVER_PATH || '/opt/hytale/server',
-  hytaleContainerBackupsPath: process.env.HYTALE_CONTAINER_BACKUPS_PATH || '/opt/hytale/backups',
-  hytaleContainerDataPath: process.env.HYTALE_CONTAINER_DATA_PATH || '/opt/hytale/data',
-  hytaleContainerModsPath: process.env.HYTALE_CONTAINER_MODS_PATH || '/opt/hytale/mods',
-  hytaleContainerPluginsPath: process.env.HYTALE_CONTAINER_PLUGINS_PATH || '/opt/hytale/plugins',
-  hytaleContainerAssetsPath: process.env.HYTALE_CONTAINER_ASSETS_PATH || '/opt/hytale/assets',
-  
+  // Host downloader path (where downloader is stored on manager; under manager data path)
+  hostDownloaderPath: path.join(MANAGER_DATA_PATH_RESOLVED, 'hytale-downloader'),
+
+  // When set (e.g. when manager runs in Docker), use this as the source path in the docker cp helper command
+  // so users see the path on their host that maps to the manager volume (e.g. ./manager-data or /var/lib/docker/volumes/...)
+  hostPathForDockerCp: process.env.HOST_PATH_FOR_DOCKER_CP || undefined,
+
+  // Container paths (derived from GAME_CONTAINER_PATH; for display / docker cp; always posix)
+  hytaleContainerServerPath: GAME_CONTAINER_PATH_BASE.replace(/\\/g, '/'),
+  hytaleContainerBackupsPath: path.posix.join(GAME_CONTAINER_PATH_BASE.replace(/\\/g, '/'), 'backups'),
+  hytaleContainerModsPath: path.posix.join(GAME_CONTAINER_PATH_BASE.replace(/\\/g, '/'), 'mods'),
+  hytaleContainerAssetsPath: path.posix.join(GAME_CONTAINER_PATH_BASE.replace(/\\/g, '/'), 'assets'),
+
+  effectiveBackupsPath: path.join(process.env.GAME_SERVER_DATA_PATH || '/opt/hytale/server', 'backups'),
+  effectiveAssetsPath: path.join(process.env.GAME_SERVER_DATA_PATH || '/opt/hytale/server', 'assets'),
+
   // Hytale downloader URL
   hytaleDownloaderUrl: process.env.HYTALE_DOWNLOADER_URL || 'https://downloader.hytale.com/hytale-downloader.zip',
 
@@ -293,9 +290,7 @@ export function reloadConfigFromFile(): void {
   try {
     // Check manager data path first, then fall back to game data path
     let configPath = CONFIG_FILE_PATH;
-    if (!fs.existsSync(configPath)) {
-      configPath = CONFIG_FILE_PATH_FALLBACK;
-    }
+
     if (fs.existsSync(configPath)) {
       const content = fs.readFileSync(configPath, 'utf-8');
       const newConfigJson = JSON.parse(content) as ConfigJson;
@@ -344,7 +339,7 @@ export function reloadConfigFromFile(): void {
 export function checkSecurityConfig(): void {
   // Check if config.json exists (regardless of setupComplete status)
   // Check manager data path first, then fall back to game data path
-  const configJsonExists = fs.existsSync(CONFIG_FILE_PATH) || fs.existsSync(CONFIG_FILE_PATH_FALLBACK);
+  const configJsonExists = fs.existsSync(CONFIG_FILE_PATH)
 
   // If no config.json exists, we're in SETUP MODE - skip security check
   // The setup wizard will handle initial configuration

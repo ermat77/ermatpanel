@@ -1,28 +1,6 @@
 # ============================================================
 # Development Docker Compose - Hytale Server Only
 # ============================================================
-# Use this for local development:
-#   docker-compose -f docker-compose.dev.yml up -d
-#
-# This runs ONLY the Hytale server container.
-# Backend and frontend run locally on your machine.
-#
-# DEVELOPMENT MODE:
-#   - Manager (backend + frontend): Runs locally (not containerized)
-#   - HytaleServer: Runs in Docker container
-#   - Backend connects to container via Docker API
-#   - Plugin API accessible on localhost:18085
-#
-# VOLUME MOUNTS:
-#   - Server files must be in ./hytale-server/ folder (or set HOST_DATA_PATH)
-#   - Files are bind-mounted into container
-#   - Changes in Cursor/editor are immediately visible in container
-#
-# NETWORKING:
-#   - Container on 'dev-net' bridge network
-#   - Container name: ${STACK_NAME}-dev (default: hytale-dev)
-#   - Plugin port 18085 exposed to host for local backend
-# ============================================================
 
 services:
   hytale:
@@ -50,17 +28,11 @@ services:
       
       # Auth
       - AUTH_MODE=${AUTH_MODE:-}
-      
-      # Download URLs (Option 1)
-      - SERVER_JAR_URL=${SERVER_JAR_URL:-}
-      - ASSETS_URL=${ASSETS_URL:-}
-      
-      # Hytale Downloader (Option 2)
-      - USE_HYTALE_DOWNLOADER=${USE_HYTALE_DOWNLOADER:-false}
-      - HYTALE_PATCHLINE=${HYTALE_PATCHLINE:-release}
-      
-      # Auto-update on restart
-      - AUTO_UPDATE=${AUTO_UPDATE:-false}
+
+      # Game data path: where manager sees game files (same volume as game container)
+      - GAME_SERVER_DATA_PATH=${GAME_SERVER_DATA_PATH:-/opt/hytale/server}
+      # Manager data path (volume mount point)
+      - MANAGER_DATA_PATH=${MANAGER_DATA_PATH:-/app/data}
 
       # EasyWebMap (optional)
       - WEBMAP_PORT=${WEBMAP_PORT:-18081}
@@ -74,23 +46,12 @@ services:
       # Plugin API port (exposed for local backend connection)
       - "18085:18085/tcp"
     
-    # Volumes - Bind Mounts (HOST_DATA_PATH -> /opt/hytale in Container)
-    # IMPORTANT: Server files (HytaleServer.jar, Assets.zip) must be in hytale-server/ folder
-    # If files are missing, container will:
-    #   1. Check for download URLs (SERVER_JAR_URL, ASSETS_URL)
-    #   2. Use Hytale Downloader (USE_HYTALE_DOWNLOADER=true)
-    #   3. Wait for manual file copy
-    # Bundling mechanism removed - files must come from volume or download
+    # Volumes - Bind mount (host folder). Use a named volume to avoid anonymous volume IDs.
+    # Named: replace the line below with "hytale-dev-server-data:/opt/hytale/server" and uncomment the volumes section at the bottom.
     volumes:
-      # Using relative paths (relative to docker-compose.dev.yml location)
-      # Alternative: Use ${PWD}/hytale-server for absolute paths (if PWD env var is set)
-      - ${PWD}/${HOST_DATA_PATH:-hytale-server}:/opt/hytale/server
-      - ${PWD}/${HOST_DATA_PATH:-hytale-server}/data:/opt/hytale/data
-      - ${PWD}/${HOST_DATA_PATH:-hytale-server}/backups:/opt/hytale/backups
-      - ${PWD}/${HOST_DATA_PATH:-hytale-server}/mods:/opt/hytale/mods
-      - ${PWD}/${HOST_DATA_PATH:-hytale-server}/downloader:/opt/hytale/downloader
-      - ${PWD}/${HOST_DATA_PATH:-hytale-server}/auth:/opt/hytale/auth
-      - ${PWD}/${HOST_DATA_PATH:-hytale-server}/updater:/opt/hytale/server/updater
+      - type: bind
+        source: ${GAME_SERVER_DATA_PATH:-hytale-server}
+        target: /opt/hytale/server
 
     # Console
     stdin_open: true
@@ -139,10 +100,14 @@ services:
 # ============================================================
 # Networks
 # ============================================================
-# Bridge network allows container to be accessible from host
-# Container name resolves to IP on this network
-# Backend running locally connects via Docker socket (not this network)
 networks:
   dev-net:
     name: ${STACK_NAME:-hytale}-dev-net
     driver: bridge
+
+# ============================================================
+# Named volume (optional - use instead of bind mount to avoid anonymous volume IDs)
+# Uncomment "hytale-dev-server-data" in service volumes and comment the bind mount line
+# ============================================================
+# volumes:
+#   hytale-dev-server-data:

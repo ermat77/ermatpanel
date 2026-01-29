@@ -36,35 +36,22 @@ chown -R hytale:hytale /opt/hytale
 chmod -R g+rw /opt/hytale 2>/dev/null || true
 
 # ============================================================
-# Debug: Log PWD and check bind mount for data/test file
+# Create folders at server root (worlds is created by HytaleServer.jar)
 # ============================================================
-echo "[DEBUG] PWD environment variable: ${PWD:-not set}"
-echo "[DEBUG] Checking bind mount for data/test file..."
-if [ -f "/opt/hytale/data/test" ]; then
-    echo "[DEBUG] ✅ Found /opt/hytale/data/test in bound volume!"
-    echo "[DEBUG]    Content: $(cat /opt/hytale/data/test 2>/dev/null || echo 'could not read')"
-    echo "[DEBUG]    File size: $(stat -c%s /opt/hytale/data/test 2>/dev/null || echo 'unknown') bytes"
-    echo "[DEBUG]    File permissions: $(ls -l /opt/hytale/data/test 2>/dev/null || echo 'unknown')"
-else
-    echo "[DEBUG] ❌ /opt/hytale/data/test NOT found in bound volume"
-    echo "[DEBUG]    Checking if /opt/hytale/data directory exists..."
-    if [ -d "/opt/hytale/data" ]; then
-        echo "[DEBUG]    ✅ /opt/hytale/data directory exists"
-        echo "[DEBUG]    Contents of /opt/hytale/data:"
-        ls -la /opt/hytale/data/ 2>/dev/null || echo "      (could not list)"
-    else
-        echo "[DEBUG]    ❌ /opt/hytale/data directory does NOT exist"
-    fi
+SERVER_ROOT="/opt/hytale/server"
+# If "universe" exists but is not a directory (e.g. file or broken symlink from host), remove it so Hytale can create it
+if [ -e "$SERVER_ROOT/universe" ] && [ ! -d "$SERVER_ROOT/universe" ]; then
+    echo "[WARN] Removing non-directory 'universe' so server can create it as a directory"
+    rm -f "$SERVER_ROOT/universe"
 fi
+mkdir -p "$SERVER_ROOT/mods" "$SERVER_ROOT/universe" "$SERVER_ROOT/backups" "$SERVER_ROOT/logs" "$SERVER_ROOT/auth"
 
-# ============================================================
+AUTH_DIR="$SERVER_ROOT/auth"
+MACHINE_ID_FILE="${AUTH_DIR}/.machine-id"
+
 # Setup persistent machine-id for encrypted auth
-# ============================================================
-MACHINE_ID_FILE="/opt/hytale/data/.machine-id"
-
 if [ ! -f "$MACHINE_ID_FILE" ]; then
     echo "[INFO] Generating persistent machine-id..."
-    # Generate a random UUID-style machine-id
     cat /proc/sys/kernel/random/uuid | tr -d '-' > "$MACHINE_ID_FILE"
     chown hytale:hytale "$MACHINE_ID_FILE"
 fi
@@ -81,269 +68,28 @@ if [ -f "$MACHINE_ID_FILE" ]; then
 fi
 
 # ============================================================
-# Check/Download server files
+# Check server files (provided by manager or manual copy)
 # ============================================================
 echo "[INFO] Checking server files..."
 
 SERVER_JAR="/opt/hytale/server/HytaleServer.jar"
 ASSETS_FILE="/opt/hytale/server/Assets.zip"
-DOWNLOADER_DIR="/opt/hytale/downloader"
-CREDENTIALS_FILE="${DOWNLOADER_DIR}/.hytale-downloader-credentials.json"
 
-# Function to get patchline from panel config or env
-get_patchline() {
-    PANEL_CONFIG="/opt/hytale/data/panel-config.json"
-
-    # First try to read from panel config file
-    if [ -f "$PANEL_CONFIG" ]; then
-        # Extract patchline value from JSON using grep/sed (jq might not be available)
-        PANEL_PATCHLINE=$(cat "$PANEL_CONFIG" 2>/dev/null | grep -o '"patchline"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"patchline"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
-        if [ -n "$PANEL_PATCHLINE" ]; then
-            echo "$PANEL_PATCHLINE"
-            return
-        fi
-    fi
-
-    # Fallback to environment variable or default
-    echo "${HYTALE_PATCHLINE:-release}"
-}
-
-# Function to run Hytale Downloader
-run_downloader() {
-    local UPDATE_MODE="$1"
-
-    mkdir -p "$DOWNLOADER_DIR"
-    chown hytale:hytale "$DOWNLOADER_DIR"
-
-    # Download the downloader tool
-    DOWNLOADER_BIN="${DOWNLOADER_DIR}/hytale-downloader-linux-amd64"
-
-    if [ ! -f "$DOWNLOADER_BIN" ]; then
-        echo "[INFO] Downloading Hytale Downloader from official source..."
-        cd "$DOWNLOADER_DIR"
-        gosu hytale wget -q --show-progress -O hytale-downloader.zip "https://downloader.hytale.com/hytale-downloader.zip"
-        gosu hytale unzip -o hytale-downloader.zip
-        chmod +x hytale-downloader-linux-amd64 2>/dev/null || true
-        rm -f hytale-downloader.zip
-    fi
-
-    cd "$DOWNLOADER_DIR"
-    PATCHLINE=$(get_patchline)
-    echo "[INFO] Using patchline: $PATCHLINE"
-    DOWNLOAD_PATH="/opt/hytale/server/game.zip"
-    VERSION_FILE="/opt/hytale/server/.hytale-version"
-
-    # For update mode: Check version FIRST before downloading
-    if [ "$UPDATE_MODE" = "update" ]; then
-        echo "[INFO] Checking for updates..."
-
-        # Get latest version from downloader
-        LATEST_VERSION=$(gosu hytale ./hytale-downloader-linux-amd64 -patchline "$PATCHLINE" -print-version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-
-        if [ -z "$LATEST_VERSION" ]; then
-            echo "[WARN] Could not determine latest version, skipping update check"
-            return 0
-        fi
-
-        # Get installed version
-        INSTALLED_VERSION=""
-        if [ -f "$VERSION_FILE" ]; then
-            INSTALLED_VERSION=$(cat "$VERSION_FILE")
-        fi
-
-        echo "[INFO] Installed version: ${INSTALLED_VERSION:-unknown}"
-        echo "[INFO] Latest version: $LATEST_VERSION"
-
-        # Compare versions
-        if [ "$INSTALLED_VERSION" = "$LATEST_VERSION" ]; then
-            echo "[INFO] Server is already up to date! (v$INSTALLED_VERSION)"
-            return 0
-        fi
-
-        echo "[INFO] Update available: $INSTALLED_VERSION -> $LATEST_VERSION"
-        # Remove old zip to force download of new version
-        rm -f "$DOWNLOAD_PATH"
-    fi
-    
-    # Loop until download succeeds
-    MAX_ATTEMPTS=60
-    ATTEMPT=0
-    
-    while [ ! -f "$DOWNLOAD_PATH" ]; do
-        ATTEMPT=$((ATTEMPT + 1))
-        
-        # Check if credentials exist
-        if [ ! -f "$CREDENTIALS_FILE" ]; then
-            echo ""
-            echo "╔══════════════════════════════════════════════════════════╗"
-            echo "║  AUTHENTICATION REQUIRED                                 ║"
-            echo "╠══════════════════════════════════════════════════════════╣"
-            echo "║  1. A URL and code will appear below                     ║"
-            echo "║  2. Open the URL in your browser                         ║"
-            echo "║  3. Enter the code and login with your Hytale account    ║"
-            echo "║  4. Wait - download will start automatically             ║"
-            echo "╚══════════════════════════════════════════════════════════╝"
-            echo ""
-        fi
-        
-        if [ "$UPDATE_MODE" = "update" ]; then
-            echo "[INFO] Checking for updates (attempt ${ATTEMPT})..."
-        else
-            echo "[INFO] Attempting download (attempt ${ATTEMPT})..."
-        fi
-        
-        # Run downloader directly - output goes straight to console
-        gosu hytale ./hytale-downloader-linux-amd64 -patchline "$PATCHLINE" -download-path "$DOWNLOAD_PATH" -skip-update-check
-        RESULT=$?
-        
-        if [ $RESULT -eq 0 ] && [ -f "$DOWNLOAD_PATH" ]; then
-            echo "[INFO] Download successful!"
-            break
-        else
-            # Exit code 3 = already up to date (no download needed)
-            if [ $RESULT -eq 3 ]; then
-                echo "[INFO] Server is already up to date!"
-                return 0
-            fi
-            
-            echo "[WARN] Download failed (exit code: $RESULT)"
-            
-            # If no credentials file exists after failure, it was an auth problem
-            if [ ! -f "$CREDENTIALS_FILE" ]; then
-                echo "[WARN] No credentials found - authentication may have failed"
-            else
-                echo "[INFO] Credentials exist - keeping them for retry (server may be overloaded)"
-            fi
-            
-            if [ $ATTEMPT -ge $MAX_ATTEMPTS ]; then
-                echo "[ERROR] Max attempts reached."
-                
-                # For updates, just continue with existing files
-                if [ "$UPDATE_MODE" = "update" ]; then
-                    echo "[WARN] Update check failed, continuing with existing files..."
-                    return 1
-                fi
-                
-                echo "[ERROR] Please check:"
-                echo "  - Is your Hytale account valid?"
-                echo "  - Do you own the game?"
-                echo "  - Are Hytale servers online?"
-                echo ""
-                echo "[INFO] Container will keep running. You can:"
-                echo "  1. Check logs and try again: docker restart hytale"
-                echo "  2. Manually copy files: docker cp HytaleServer.jar hytale:/opt/hytale/server/"
-                echo ""
-                echo "[WAIT] Waiting for manual intervention..."
-                
-                # Wait forever instead of crashing
-                while true; do
-                    if [ -f "$SERVER_JAR" ] && [ -f "$ASSETS_FILE" ]; then
-                        echo "[INFO] Files detected! Continuing..."
-                        return 0
-                    fi
-                    sleep 10
-                done
-            fi
-            
-            echo "[INFO] Waiting 10 seconds before retry..."
-            sleep 10
-        fi
-    done
-    
-    # Extract the downloaded zip
-    if [ -f "$DOWNLOAD_PATH" ]; then
-        echo "[INFO] Extracting game files..."
-        cd /opt/hytale/server
-        
-        # Backup current JAR version info (if updating)
-        if [ "$UPDATE_MODE" = "update" ] && [ -f "$SERVER_JAR" ]; then
-            echo "[INFO] Updating server files..."
-        fi
-        
-        gosu hytale unzip -o game.zip
-        
-        # Move files to correct locations
-        if [ -d "Server" ]; then
-            mv Server/* . 2>/dev/null || true
-            rm -rf Server
-        fi
-        
-        rm -f game.zip
-        echo "[INFO] Extraction complete!"
-
-        # Save installed version to file for future update checks
-        if [ -n "$LATEST_VERSION" ]; then
-            echo "$LATEST_VERSION" > "$VERSION_FILE"
-            chown hytale:hytale "$VERSION_FILE"
-            echo "[INFO] Saved version $LATEST_VERSION to $VERSION_FILE"
-        else
-            # For fresh installs, get and save the version
-            cd "$DOWNLOADER_DIR"
-            INSTALLED_VER=$(./hytale-downloader-linux-amd64 -patchline "$PATCHLINE" -print-version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-            if [ -n "$INSTALLED_VER" ]; then
-                echo "$INSTALLED_VER" > "$VERSION_FILE"
-                chown hytale:hytale "$VERSION_FILE"
-                echo "[INFO] Saved version $INSTALLED_VER to $VERSION_FILE"
-            fi
-        fi
-    fi
-
-    return 0
-}
-
-# Check if files exist (from volume mount, download URLs, or downloader)
 if [ -f "$SERVER_JAR" ] && [ -f "$ASSETS_FILE" ]; then
     echo "[INFO] Server files found!"
-    
-    # Auto-update check
-    if [ "$AUTO_UPDATE" = "true" ] && [ "$USE_HYTALE_DOWNLOADER" = "true" ]; then
-        echo "[INFO] AUTO_UPDATE enabled - checking for updates..."
-        run_downloader "update"
-    fi
-    
-# Option 1: Download URLs provided
-elif [ -n "$SERVER_JAR_URL" ] && [ -n "$ASSETS_URL" ]; then
-    echo "[INFO] Downloading server files from URLs..."
-    
-    if [ ! -f "$SERVER_JAR" ]; then
-        echo "[INFO] Downloading HytaleServer.jar..."
-        gosu hytale wget -q --show-progress -O "$SERVER_JAR" "$SERVER_JAR_URL"
-    fi
-    
-    if [ ! -f "$ASSETS_FILE" ]; then
-        echo "[INFO] Downloading Assets.zip (~3GB)..."
-        gosu hytale wget -q --show-progress -O "$ASSETS_FILE" "$ASSETS_URL"
-    fi
-    
-    echo "[INFO] Download complete!"
-
-# Option 2: Use official Hytale Downloader
-elif [ "$USE_HYTALE_DOWNLOADER" = "true" ]; then
-    echo "[INFO] Using official Hytale Downloader..."
-    run_downloader "fresh"
-
-# No method configured - wait for manual copy
 else
     echo ""
     echo "╔══════════════════════════════════════════════════════════╗"
     echo "║  SERVER FILES NOT FOUND!                                 ║"
     echo "╠══════════════════════════════════════════════════════════╣"
-    echo "║  Option 1: Set download URLs in Portainer                ║"
-    echo "║    SERVER_JAR_URL=https://your-nas/HytaleServer.jar      ║"
-    echo "║    ASSETS_URL=https://your-nas/Assets.zip                ║"
-    echo "║                                                          ║"
-    echo "║  Option 2: Use official Hytale Downloader                ║"
-    echo "║    USE_HYTALE_DOWNLOADER=true                            ║"
-    echo "║    (Requires OAuth login on first run)                   ║"
-    echo "║                                                          ║"
-    echo "║  Option 3: Copy files manually                           ║"
-    echo "║    docker cp HytaleServer.jar hytale:/opt/hytale/server/ ║"
-    echo "║    docker cp Assets.zip hytale:/opt/hytale/server/       ║"
-    echo "║    docker restart hytale                                 ║"
+    echo "║  Provide files via the manager setup wizard, or copy:    ║"
+    echo "║    docker cp HytaleServer.jar <container>:/opt/hytale/server/ ║"
+    echo "║    docker cp Assets.zip <container>:/opt/hytale/server/  ║"
+    echo "║    docker restart <container>                            ║"
     echo "╚══════════════════════════════════════════════════════════╝"
     echo ""
     echo "[WAIT] Waiting for server files..."
-    
+
     while true; do
         if [ -f "$SERVER_JAR" ] && [ -f "$ASSETS_FILE" ]; then
             echo "[INFO] Files detected! Continuing..."
@@ -367,50 +113,6 @@ if [ ! -f "$SERVER_JAR" ] || [ ! -f "$ASSETS_FILE" ]; then
 fi
 
 echo "[INFO] Server files verified!"
-
-# ============================================================
-# Setup symlinks for persistence
-# ============================================================
-echo "[INFO] Setting up data directories..."
-
-mkdir -p /opt/hytale/data/worlds
-if [ ! -L "/opt/hytale/server/universe" ]; then
-    rm -rf /opt/hytale/server/universe 2>/dev/null || true
-    ln -sfn /opt/hytale/data /opt/hytale/server/universe
-fi
-
-mkdir -p /opt/hytale/plugins
-ln -sfn /opt/hytale/plugins /opt/hytale/server/plugins 2>/dev/null || true
-
-mkdir -p /opt/hytale/mods
-ln -sfn /opt/hytale/mods /opt/hytale/server/mods 2>/dev/null || true
-
-# Auth credentials - symlink to persistent volume
-mkdir -p /opt/hytale/auth
-if [ ! -L "/opt/hytale/server/.auth" ]; then
-    rm -rf /opt/hytale/server/.auth 2>/dev/null || true
-    ln -sfn /opt/hytale/auth /opt/hytale/server/.auth
-fi
-
-# ============================================================
-# Copy downloader credentials to server auth directory
-# ============================================================
-DOWNLOADER_CREDS="/opt/hytale/downloader/.hytale-downloader-credentials.json"
-SERVER_AUTH_DIR="/opt/hytale/auth"
-
-if [ -f "$DOWNLOADER_CREDS" ]; then
-    echo "[INFO] Found downloader credentials, copying to server auth directory..."
-
-    # Copy with different possible names the server might look for
-    cp "$DOWNLOADER_CREDS" "$SERVER_AUTH_DIR/.hytale-downloader-credentials.json" 2>/dev/null || true
-    cp "$DOWNLOADER_CREDS" "$SERVER_AUTH_DIR/credentials.json" 2>/dev/null || true
-    cp "$DOWNLOADER_CREDS" "$SERVER_AUTH_DIR/.credentials" 2>/dev/null || true
-    cp "$DOWNLOADER_CREDS" "$SERVER_AUTH_DIR/oauth_credentials.json" 2>/dev/null || true
-
-    echo "[INFO] Credentials copied to server auth directory"
-else
-    echo "[WARN] No downloader credentials found at $DOWNLOADER_CREDS"
-fi
 
 chown -R hytale:hytale /opt/hytale
 chmod -R g+rw /opt/hytale 2>/dev/null || true

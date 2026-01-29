@@ -44,7 +44,7 @@ interface QuickCommand {
 }
 
 // Store config in data directory which is a persistent volume
-const CONFIG_FILE = path.join(config.hytaleContainerDataPath, 'manager-config.json');
+const CONFIG_FILE = path.join(config.managerDataPath, 'manager-config.json');
 
 // Default configuration
 const DEFAULT_CONFIG: ScheduleConfig = {

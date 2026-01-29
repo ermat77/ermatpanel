@@ -81,21 +81,19 @@ interface SearchResult {
 export function findAssetsArchive(): string | null {
   const possibleNames = ['Assets.zip', 'assets.zip', 'ASSETS.ZIP'];
 
+  console.log('[Assets] findAssetsArchive: process.env.GAME_SERVER_DATA_PATH =', config.gameDataPath);
+
   for (const name of possibleNames) {
-    const archivePath = path.join(config.hytaleContainerServerPath, name);
-    if (fs.existsSync(archivePath)) {
+    const archivePath = path.join(config.gameDataPath, name);
+    const exists = fs.existsSync(archivePath);
+    console.log('[Assets] findAssetsArchive: checking', archivePath, 'exists =', exists);
+    if (exists) {
+      console.log('[Assets] findAssetsArchive: found archive at', archivePath);
       return archivePath;
     }
   }
 
-  // Also check in data directory
-  for (const name of possibleNames) {
-    const archivePath = path.join(config.hytaleContainerDataPath, name);
-    if (fs.existsSync(archivePath)) {
-      return archivePath;
-    }
-  }
-
+  console.log('[Assets] findAssetsArchive: no archive found in', config.gameDataPath);
   return null;
 }
 
@@ -129,7 +127,7 @@ async function calculateFileHashAsync(filePath: string): Promise<string> {
  * Read asset metadata
  */
 function readAssetMeta(): AssetMeta | null {
-  const metaPath = path.join(config.hytaleContainerAssetsPath, ASSET_META_FILE);
+  const metaPath = path.join(config.effectiveAssetsPath, ASSET_META_FILE);
   if (!fs.existsSync(metaPath)) {
     return null;
   }
@@ -146,7 +144,7 @@ function readAssetMeta(): AssetMeta | null {
  * Write asset metadata
  */
 function writeAssetMeta(meta: AssetMeta): void {
-  const metaPath = path.join(config.hytaleContainerAssetsPath, ASSET_META_FILE);
+  const metaPath = path.join(config.effectiveAssetsPath, ASSET_META_FILE);
   fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
 }
 
@@ -218,14 +216,19 @@ async function getDirectorySize(dirPath: string): Promise<number> {
  * Get status of the asset extraction
  */
 export async function getAssetStatus(): Promise<AssetStatus> {
+  console.log('[Assets] getAssetStatus: process.env.GAME_SERVER_DATA_PATH =', config.gameDataPath, 'effectiveAssetsPath =', config.effectiveAssetsPath);
+
   const sourceFile = findAssetsArchive();
+  console.log('[Assets] getAssetStatus: sourceFile =', sourceFile ?? '(not found)');
+
   let meta = readAssetMeta();
 
   let needsUpdate = false;
   let sourceSize = 0;
 
   // Check if assets directory exists and has content (manually copied)
-  const assetsExist = fs.existsSync(config.hytaleContainerAssetsPath);
+  const assetsExist = fs.existsSync(config.effectiveAssetsPath);
+  console.log('[Assets] getAssetStatus: assetsExist =', assetsExist, 'effectiveAssetsPath =', config.effectiveAssetsPath);
   let fileCount = meta?.fileCount || 0;
   let totalSize = 0;
 
@@ -326,8 +329,8 @@ export function extractAssets(): { success: boolean; error?: string; message?: s
 async function runExtraction(sourceFile: string): Promise<void> {
   try {
     // Create assets directory if it doesn't exist
-    if (!fs.existsSync(config.hytaleContainerAssetsPath)) {
-      fs.mkdirSync(config.hytaleContainerAssetsPath, { recursive: true });
+    if (!fs.existsSync(config.effectiveAssetsPath)) {
+      fs.mkdirSync(config.effectiveAssetsPath, { recursive: true });
     }
 
     // Clear existing assets (except meta file)
@@ -338,10 +341,7 @@ async function runExtraction(sourceFile: string): Promise<void> {
     const existingItems = await readServerDir(config.hytaleContainerAssetsPath, 'assets');
     for (const item of existingItems) {
       if (item === ASSET_META_FILE) continue;
-      const itemPath = path.posix.join(config.hytaleContainerAssetsPath, item);
-      // Note: fs.rmSync is still used for local cleanup, but we read from container
-      // The actual deletion would need to be done via Docker API if needed
-      // For now, keeping fs.rmSync as it's for local temp cleanup during extraction
+      const itemPath = path.join(config.effectiveAssetsPath, item);
       try {
         fs.rmSync(itemPath, { recursive: true, force: true });
       } catch {
@@ -355,8 +355,8 @@ async function runExtraction(sourceFile: string): Promise<void> {
     }
 
     await new Promise<void>((resolve, reject) => {
-      // Use unzip with verbose mode to track files
-      const unzip = spawn('unzip', ['-o', sourceFile, '-d', config.hytaleContainerAssetsPath], {
+      // Use unzip with verbose mode to track files (effective path so output lands on host when dev)
+      const unzip = spawn('unzip', ['-o', sourceFile, '-d', config.effectiveAssetsPath], {
         stdio: ['ignore', 'pipe', 'pipe'],
       });
 
@@ -444,8 +444,8 @@ async function runExtraction(sourceFile: string): Promise<void> {
  */
 export function clearAssets(): { success: boolean; error?: string } {
   try {
-    if (fs.existsSync(config.hytaleContainerAssetsPath)) {
-      fs.rmSync(config.hytaleContainerAssetsPath, { recursive: true, force: true });
+    if (fs.existsSync(config.effectiveAssetsPath)) {
+      fs.rmSync(config.effectiveAssetsPath, { recursive: true, force: true });
     }
     return { success: true };
   } catch (error) {
@@ -1005,8 +1005,8 @@ export async function getItemList(forceRefresh: boolean = false): Promise<ItemIn
   const seenIds = new Set<string>();
 
   // Check if assets are extracted
-  if (!fs.existsSync(config.hytaleContainerAssetsPath)) {
-    console.log('[Items] Assets path does not exist:', config.hytaleContainerAssetsPath);
+  if (!fs.existsSync(config.effectiveAssetsPath)) {
+    console.log('[Items] Assets path does not exist:', config.effectiveAssetsPath);
     return items;
   }
 

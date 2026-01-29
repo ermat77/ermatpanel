@@ -104,13 +104,11 @@ export function extractBaseModName(filename: string): string {
 }
 
 // Helper: Determine basePath from directory path
-function getBasePathFromDir(dirPath: string): 'mods' | 'server' | 'data' {
+function getBasePathFromDir(dirPath: string): 'mods' | 'server' {
   if (dirPath.startsWith(config.hytaleContainerModsPath)) {
     return 'mods';
   } else if (dirPath.startsWith(config.hytaleContainerServerPath)) {
     return 'server';
-  } else if (dirPath.startsWith(config.hytaleContainerDataPath)) {
-    return 'data';
   }
   // Default to mods if can't determine
   return 'mods';
