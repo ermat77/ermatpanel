@@ -1,9 +1,0 @@
-{
-  "httpPort": 18085,
-  "authEnabled": false,
-  "authToken": "",
-  "corsEnabled": true,
-  "corsOrigin": "*",
-  "wsHeartbeatSeconds": 30,
-  "logRequests": false
-}

@@ -10,7 +10,6 @@
 manager-data/
 backups/
 logs/
-server/
 hytale-server/
 
 # Environment (enthält evtl. URLs/Secrets)
@@ -21,6 +20,8 @@ hytale-server/
 .idea/
 .vscode/
 *.swp
+
+plugins/kyuubisoft-api/run/
 
 # OS
 .DS_Store
