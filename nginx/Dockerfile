@@ -15,6 +15,8 @@ RUN rm -f /etc/nginx/conf.d/default.conf
 
 # Template will be processed by entrypoint and written to conf.d
 COPY default.conf.template /etc/nginx/templates/default.conf.template
+# Static test page for connectivity checks (see /hello in config)
+COPY hello.html /usr/share/nginx/html/hello.html
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

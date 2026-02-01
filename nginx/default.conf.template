@@ -1,8 +1,40 @@
 # Manager reverse proxy - server_name and listen are set from env (envsubst at runtime).
 # HTTPS (port 443) can be added later with an extra server block and ssl_* directives.
+
+# Detailed log format for debugging (request URI, status, timing, upstream)
+log_format debug '$remote_addr - $scheme $host "$request" $status $body_bytes_sent '
+                 '"$upstream_addr" rt=$request_time uat="$upstream_response_time" '
+                 '"$http_referer" "$http_user_agent"';
+
+# JSON-style log for parsing (optional: use 'debug' or 'json' in access_log)
+log_format json escape=json '{'
+    '"time":"$time_iso8601",'
+    '"remote_addr":"$remote_addr",'
+    '"scheme":"$scheme",'
+    '"host":"$host",'
+    '"request":"$request",'
+    '"status":$status,'
+    '"body_bytes_sent":$body_bytes_sent,'
+    '"request_time":$request_time,'
+    '"upstream_response_time":"$upstream_response_time",'
+    '"upstream_addr":"$upstream_addr",'
+    '"referer":"$http_referer",'
+    '"user_agent":"$http_user_agent"'
+'}';
+
 server {
     listen ${NGINX_HTTP_PORT} default_server;
     server_name _ ${MANAGER_PUBLIC_HOST};
+
+    # Log to stdout so 'docker compose logs nginx' shows everything
+    access_log /dev/stdout debug;
+    error_log /dev/stderr info;
+
+    # Static test page – if this loads, nginx and network/firewall are OK
+    location = /hello {
+        default_type text/html;
+        alias /usr/share/nginx/html/hello.html;
+    }
 
     # Proxy all traffic to the manager (frontend + API + WebSockets)
     location / {

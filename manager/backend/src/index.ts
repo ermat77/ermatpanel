@@ -32,7 +32,7 @@ import serverFilesRoutes from './routes/serverFiles.js';
 
 // Services
 import { startSchedulers } from './services/scheduler.js';
-import { initializePlayerTracking } from './services/players.js';
+import { initializePlayerTracking, processLogLine } from './services/players.js';
 import { initializePluginEvents, disconnectFromPluginWebSocket } from './services/pluginEvents.js';
 import { initializeRoles } from './services/roles.js';
 import { isSetupComplete } from './services/setupService.js';
@@ -273,9 +273,13 @@ app.use(helmet({
       baseUri: ["'self'"],
       formAction: ["'self'"],
       frameAncestors: ["'none'"], // Prevent clickjacking
-      // Note: upgradeInsecureRequests removed - only use if running behind HTTPS proxy
+      // Disable so browser does not upgrade http assets to https when serving over HTTP only
+      upgradeInsecureRequests: null,
     },
   },
+  // Disable HSTS when serving over HTTP only – otherwise the browser upgrades all requests
+  // (including assets) to HTTPS and they never reach our server. Re-enable when you add TLS.
+  strictTransportSecurity: false,
   // Additional security headers
   crossOriginEmbedderPolicy: false, // Disable for compatibility with external resources
   crossOriginOpenerPolicy: false, // Disable for HTTP compatibility
@@ -522,12 +526,10 @@ app.use(express.static(staticPath, { index: false }));
 
 // SPA fallback - serve index.html for all non-API routes
 app.get('*', (req, res) => {
-  // Don't serve index.html for API routes
   if (req.path.startsWith('/api/')) {
     res.status(404).json({ error: 'Not found' });
     return;
   }
-
   const indexPath = path.join(staticPath, 'index.html');
   res.sendFile(indexPath, (err) => {
     if (err) {

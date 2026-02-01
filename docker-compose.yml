@@ -173,6 +173,8 @@ services:
       # StackMart API (optional)
       - STACKMART_API_KEY=${STACKMART_API_KEY:-}
 
+      - DEBUG_ASSETS=true
+
     ports:
       - "${MANAGER_PORT:-18080}:18080"
 
