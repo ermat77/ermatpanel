@@ -3,7 +3,7 @@
 # ============================================================
 #
 # STACK_NAME: ${STACK_NAME} (Standard: hytale)
-#   -> Container: ${STACK_NAME}, ${STACK_NAME}-manager
+#   -> Container: ${STACK_NAME}, ${STACK_NAME}-manager, ${STACK_NAME}-nginx (optional)
 #   -> Netzwerk: ${STACK_NAME}-net
 #
 # GAME_SERVER_DATA_PATH: host path for game data (bind mount) or use named volume hytale-server-data
@@ -21,7 +21,7 @@
 # 3. docker-compose up -d
 #
 # WEB MANAGER:
-# Nach dem Start erreichbar unter http://localhost:18080
+# Nach dem Start erreichbar unter http://localhost:18080 (direkt) oder http://localhost (via nginx)
 # Login mit MANAGER_USERNAME/MANAGER_PASSWORD
 #
 # ============================================================
@@ -226,6 +226,48 @@ services:
       - SETUID           # Required for switching to manager user
       - SETGID           # Required for switching to manager group
       - DAC_OVERRIDE     # Required for chmod on bind-mounted volumes (files owned by other UIDs)
+
+  # ============================================================
+  # Nginx reverse proxy (optional) - Manager frontend at configurable URL
+  # ============================================================
+  # When using nginx: set TRUST_PROXY=true and CORS_ORIGINS to the public URL(s).
+  # MANAGER_PUBLIC_HOST: domain and/or IP (space-separated), or _ for any host.
+  nginx:
+    build: ./nginx
+    container_name: ${STACK_NAME:-hytale}-nginx
+    hostname: ${STACK_NAME:-hytale}-nginx
+    restart: unless-stopped
+
+    environment:
+      - MANAGER_PUBLIC_HOST=${MANAGER_PUBLIC_HOST:-_}
+      - NGINX_HTTP_PORT=${NGINX_HTTP_PORT:-80}
+
+    ports:
+      - "${NGINX_HTTP_PORT:-80}:${NGINX_HTTP_PORT:-80}"
+
+    networks:
+      - internal-net
+
+    depends_on:
+      - hytale-manager
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 64M
+        reservations:
+          cpus: '0.1'
+          memory: 16M
+
+    security_opt:
+      - no-new-privileges:true
 
 # ============================================================
 # Networks
