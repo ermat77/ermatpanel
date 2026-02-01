@@ -2,17 +2,22 @@
 # Hytale Server Manager - Dockerfile
 # Multi-stage build: Frontend + Backend (Node.js/TypeScript)
 # ============================================================
+# Build context MUST be the manager directory (docker-compose: context: ./manager).
+# COPY paths (frontend/, backend/, entrypoint.sh) are relative to that context.
+# ============================================================
 
-# Stage 1: Build Frontend
-FROM node:20-alpine AS frontend-builder
+# Stage 1: Build Frontend (Debian base so Rollup's optional native binary installs; Alpine + optional deps often fail)
+FROM node:20-slim AS frontend-builder
 
 WORKDIR /app/frontend
 
-# Copy package files
-COPY frontend/package.json ./
+# Copy package files (lockfile = fast install like local)
+COPY frontend/package.json frontend/package-lock.json ./
 
-# Install dependencies
-RUN npm install
+# Install dependencies (slim has glibc so @rollup/rollup-linux-x64-gnu installs and Vite build works)
+RUN --mount=type=cache,target=/root/.npm \
+    npm config set fetch-timeout 120000 && \
+    npm ci
 
 # Copy frontend source
 COPY frontend/ ./
@@ -29,8 +34,9 @@ WORKDIR /app/backend
 # Copy package files
 COPY backend/package.json ./
 
-# Install dependencies (including dev for build)
-RUN npm install
+# Install dependencies (including dev for build; timeout so build fails instead of hanging)
+RUN npm config set fetch-timeout 300000 && \
+    npm install --loglevel verbose --timing
 
 # Copy backend source
 COPY backend/ ./
@@ -58,7 +64,7 @@ WORKDIR /app
 
 # Copy package files and install production dependencies only
 COPY backend/package.json ./
-RUN npm install --omit=dev && npm cache clean --force
+RUN npm install --omit=dev --loglevel verbose && npm cache clean --force
 
 # Copy built backend from builder
 COPY --from=backend-builder /app/backend/dist ./dist

@@ -22,12 +22,13 @@ const BASE_PATH_SUBDIRS: Record<ContainerBasePath, string> = {
   backups: 'backups',
   mods: 'mods',
   assets: 'assets',
+  data: 'data',
 };
 
 /**
  * Base path types for server file access (same API as before).
  */
-export type ContainerBasePath = 'server' | 'backups' | 'mods' | 'assets';
+export type ContainerBasePath = 'server' | 'backups' | 'mods' | 'assets' | 'data';
 
 /**
  * Resolve filePath + basePath to a local filesystem path under server root.

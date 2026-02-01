@@ -181,14 +181,14 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
 
       # Same game server volume as hytale service (read/write configs, backups, mods, etc.)
-      - hytale-server-data:/opt/hytale/server
+      - hytale-server-data:${GAME_SERVER_DATA_PATH:-/opt/hytale/server}
 
       # Manager persistent data
       # Default: Docker volume (persists between container restarts)
       # To use bind mount in dev, override this in docker-compose.override.yml:
       #   volumes:
       #     - ./manager-data:/app/data
-      - manager-data:/app/data
+      - manager-data:${MANAGER_DATA_PATH:-/app/data}
 
     networks:
       - internal-net

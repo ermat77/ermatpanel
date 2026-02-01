@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { spawn } from 'child_process';
+import * as tarStream from 'tar-stream';
 import { config } from '../config.js';
 import type { ServerStatus, ServerStats, ActionResponse } from '../types/index.js';
 import { validateCommand, escapeShellArg } from '../utils/sanitize.js';
@@ -515,6 +516,49 @@ export async function execInGameServerContainer(command: string): Promise<Action
     console.error(`${logPrefix} Exception:`, errMsg, error);
     return { success: false, error: errMsg };
   }
+}
+
+/**
+ * List directory contents inside the game server container.
+ * Used in local dev when the manager has no access to the shared volume.
+ */
+export async function readContainerDir(containerPath: string): Promise<string[]> {
+  const normalizedPath = containerPath.replace(/\\/g, '/').replace(/\/+$/, '') || '/';
+  const result = await execInGameServerContainer(`ls -1 ${escapeShellArg(normalizedPath)}`);
+  if (!result.success || result.output === undefined) {
+    return [];
+  }
+  const lines = result.output.split(/\r?\n/).map((s) => s.trim()).filter((s) => s.length > 0);
+  return lines;
+}
+
+/**
+ * Copy a local file into the game server container at the given container path.
+ * Used in local dev when the manager has no access to the shared volume.
+ */
+export async function copyFileToContainer(localFilePath: string, containerPath: string): Promise<void> {
+  const container = await getContainer();
+  if (!container) {
+    throw new Error(`Container not found: ${config.gameContainerName}`);
+  }
+  const info = await container.inspect();
+  if (!info.State.Running) {
+    throw new Error(`Container is not running: ${config.gameContainerName}`);
+  }
+  const content = await fs.promises.readFile(localFilePath);
+  const entryName = containerPath.replace(/\\/g, '/').replace(/^\//, '');
+  if (!entryName) {
+    throw new Error('Invalid container path');
+  }
+  const pack = tarStream.pack();
+  pack.entry({ name: entryName, size: content.length, type: 'file' }, content);
+  pack.finalize();
+  await new Promise<void>((resolve, reject) => {
+    container.putArchive(pack, { path: '/' }, (err: Error | null) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
 }
 
 export function getDockerInstance(): Docker {

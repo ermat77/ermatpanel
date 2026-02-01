@@ -46,7 +46,7 @@ export interface PluginApiResponse {
 }
 
 /**
- * Check if the KyuubiSoft API plugin is installed in the plugins folder
+ * Check if the KyuubiSoft API plugin is installed in the mods folder
  * Always uses Docker API with container paths
  */
 export async function isPluginInstalled(): Promise<boolean> {
@@ -242,7 +242,7 @@ export async function fetchFromPlugin<T>(endpoint: string): Promise<PluginApiRes
       }
       console.error(`[KyuubiAPI]   Full error:`, fetchError);
       console.error(`[KyuubiAPI]   Troubleshooting:`);
-      console.error(`[KyuubiAPI]     - Is the plugin JAR installed in ${config.hytaleContainerPluginsPath || '/opt/hytale/plugins'}?`);
+      console.error(`[KyuubiAPI]     - Is the plugin JAR installed in the mods folder (${config.hytaleContainerModsPath || '/opt/hytale/server/mods'})?`);
       console.error(`[KyuubiAPI]     - Is the server running?`);
       console.error(`[KyuubiAPI]     - Is port 18085 exposed? (check: docker ps)`);
       console.error(`[KyuubiAPI]     - Is the plugin listening on 0.0.0.0:18085? (not just 127.0.0.1)`);
