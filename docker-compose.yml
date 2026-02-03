@@ -24,6 +24,12 @@
 # Nach dem Start erreichbar unter http://localhost:18080 (direkt) oder http://localhost (via nginx)
 # Login mit MANAGER_USERNAME/MANAGER_PASSWORD
 #
+# SFTP (optional):
+# ENABLE_SFTP=true, SFTP_PASSWORD=<password> (or add keys to server/.ssh/authorized_keys).
+# SFTP_PORT=host port mapped to container:22 (default 2222). Use a different port so the host can
+#   keep its own SSH (22) or FTP (21); connections to host:SFTP_PORT land in the container.
+# Connect: sftp -P <SFTP_PORT> hytale@<host> (user: hytale, home: game data).
+#
 # ============================================================
 
 services:
@@ -65,15 +71,20 @@ services:
       # Auto-update on restart
       - AUTO_UPDATE=${AUTO_UPDATE:-false}
 
+      # SFTP file management (opt-in): set ENABLE_SFTP=true and SFTP_PASSWORD or use SSH keys in server/.ssh/authorized_keys
+      - ENABLE_SFTP=${ENABLE_SFTP:-false}
+      - SFTP_PASSWORD=${SFTP_PASSWORD:-}
+
       # EasyWebMap (optional)
       - WEBMAP_PORT=${WEBMAP_PORT:-18081}
       - WEBMAP_WS_PORT=${WEBMAP_WS_PORT:-18082}
 
-    # Ports - UDP for game, TCP for webmap
+    # Ports - UDP for game, TCP for webmap, TCP for SFTP (when ENABLE_SFTP=true)
     ports:
       - "${SERVER_PORT:-5520}:${SERVER_PORT:-5520}/udp"
       - "${WEBMAP_PORT:-18081}:${WEBMAP_PORT:-18081}/tcp"
       - "${WEBMAP_WS_PORT:-18082}:${WEBMAP_WS_PORT:-18082}/tcp"
+      - "${SFTP_PORT:-2222}:22/tcp"
     
     # Volumes - Single mount for all game data at /opt/hytale/server
     volumes:
@@ -117,7 +128,9 @@ services:
       - SETUID           # Required for switching to hytale user
       - SETGID           # Required for switching to hytale group
       - DAC_OVERRIDE     # Required for chmod on bind-mounted volumes
+      - FOWNER           # Required for chmod on volumes (e.g. .ssh/authorized_keys)
       - NET_BIND_SERVICE # Allow binding to privileged ports if needed
+      - SYS_CHROOT       # Required for sshd privilege separation (chroot /run/sshd)
 
   # ============================================================
   # Hytale Server Manager - Web UI
@@ -234,6 +247,7 @@ services:
   # ============================================================
   # When using nginx: set TRUST_PROXY=true and CORS_ORIGINS to the public URL(s).
   # MANAGER_PUBLIC_HOST: domain and/or IP (space-separated), or _ for any host.
+  # Let's Encrypt: set LETSENCRYPT_EMAIL to enable HTTPS (cert auto-created and renewed).
   nginx:
     build: ./nginx
     container_name: ${STACK_NAME:-hytale}-nginx
@@ -243,9 +257,15 @@ services:
     environment:
       - MANAGER_PUBLIC_HOST=${MANAGER_PUBLIC_HOST:-_}
       - NGINX_HTTP_PORT=${NGINX_HTTP_PORT:-80}
+      - LETSENCRYPT_EMAIL=${LETSENCRYPT_EMAIL:-}
+      - LETSENCRYPT_STAGING=${LETSENCRYPT_STAGING:-}
 
     ports:
       - "${NGINX_HTTP_PORT:-80}:${NGINX_HTTP_PORT:-80}"
+      - "${NGINX_HTTPS_PORT:-443}:443"
+
+    volumes:
+      - nginx-letsencrypt:/etc/letsencrypt
 
     networks:
       - internal-net
@@ -287,3 +307,5 @@ volumes:
     name: ${STACK_NAME:-hytale}-server-data
   manager-data:
     name: ${STACK_NAME:-hytale}-manager-data
+  nginx-letsencrypt:
+    name: ${STACK_NAME:-hytale}-nginx-letsencrypt

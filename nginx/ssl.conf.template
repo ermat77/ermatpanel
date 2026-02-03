@@ -1,0 +1,39 @@
+# HTTPS server - used when Let's Encrypt certs exist.
+# LETSENCRYPT_LIVE is e.g. /etc/letsencrypt/live/manager.example.com
+
+server {
+    listen 443 ssl default_server;
+    server_name _ ${MANAGER_PUBLIC_HOST};
+
+    ssl_certificate ${LETSENCRYPT_LIVE}/fullchain.pem;
+    ssl_certificate_key ${LETSENCRYPT_LIVE}/privkey.pem;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL:10m;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+
+    access_log /dev/stdout debug;
+    error_log /dev/stderr info;
+
+    location /.well-known/acme-challenge/ {
+        alias /var/www/certbot/;
+    }
+
+    location = /hello {
+        default_type text/html;
+        alias /usr/share/nginx/html/hello.html;
+    }
+
+    location / {
+        proxy_pass http://hytale-manager:18080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 86400;
+        proxy_send_timeout 86400;
+    }
+}

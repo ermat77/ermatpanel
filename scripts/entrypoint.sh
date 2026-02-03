@@ -118,6 +118,51 @@ chown -R hytale:hytale /opt/hytale
 chmod -R g+rw /opt/hytale 2>/dev/null || true
 
 # ============================================================
+# SFTP (optional): persist host keys, set password, start sshd
+# ============================================================
+if [ "${ENABLE_SFTP:-false}" = "true" ]; then
+    echo "[INFO] Setting up SFTP access..."
+    HOST_KEYS_DIR="/opt/hytale/server/.ssh_host_keys"
+    mkdir -p "$HOST_KEYS_DIR"
+    for keytype in ed25519 rsa ecdsa; do
+        keyfile="$HOST_KEYS_DIR/ssh_host_${keytype}_key"
+        if [ ! -f "$keyfile" ]; then
+            ssh-keygen -t "$keytype" -f "$keyfile" -N "" -q
+        fi
+        cp -f "$keyfile" "${keyfile}.pub" /etc/ssh/ 2>/dev/null || true
+    done
+    chown root:root /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub 2>/dev/null || true
+    chmod 600 /etc/ssh/ssh_host_*_key 2>/dev/null || true
+    chmod 644 /etc/ssh/ssh_host_*_key.pub 2>/dev/null || true
+
+    if [ -n "$SFTP_PASSWORD" ]; then
+        echo "hytale:${SFTP_PASSWORD}" | chpasswd
+        echo "[INFO] SFTP password set for user 'hytale'"
+    else
+        echo "[WARN] SFTP enabled but SFTP_PASSWORD not set - use SSH keys in /opt/hytale/server/.ssh/authorized_keys"
+    fi
+
+    mkdir -p /opt/hytale/server/.ssh /opt/hytale/server/logs
+    chown hytale:hytale /opt/hytale/server/.ssh
+    chmod 700 /opt/hytale/server/.ssh
+    touch /opt/hytale/server/logs/sshd.log
+    chown hytale:hytale /opt/hytale/server/logs/sshd.log
+
+    # sshd needs /run/sshd for PID file (missing in minimal container)
+    mkdir -p /run/sshd
+    chmod 0755 /run/sshd
+
+    # -E: log to file; run in background so it survives exec below
+    nohup /usr/sbin/sshd -E /opt/hytale/server/logs/sshd.log </dev/null >>/opt/hytale/server/logs/sshd.log 2>&1 &
+    sleep 1
+    if pgrep -x sshd >/dev/null; then
+        echo "[INFO] SFTP server listening on port 22 (logs: server/logs/sshd.log)"
+    else
+        echo "[WARN] SFTP sshd failed to start; check server/logs/sshd.log"
+    fi
+fi
+
+# ============================================================
 # Start server
 # ============================================================
 echo "[INFO] Starting Hytale Server..."
