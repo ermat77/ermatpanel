@@ -21,6 +21,10 @@ const BACKUP_EXCLUDED_RELATIVE_PATHS: string[] = [
   'Assets.zip',
   'assets',
   'backups',
+  'HytaleServer.jar',
+  '.cache',
+  '.ssh',
+  '.ssh_host_keys'
 ];
 
 function isExcludedFromBackup(rel: string, excludedRelative: string[]): boolean {

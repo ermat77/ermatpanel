@@ -26,3 +26,4 @@ server {
         include /etc/nginx/snippets/root_action.conf;
     }
 }
+

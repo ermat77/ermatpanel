@@ -198,6 +198,8 @@ const ALLOWED_COMMAND_PREFIXES = [
   '/auth',
   // Native update system (Hytale 24.01.2026+)
   '/update',
+  // LuckPerms (permissions plugin)
+  '/lp', '/luckperms',
 ];
 
 /**
